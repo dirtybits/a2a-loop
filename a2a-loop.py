@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -26,6 +27,14 @@ PLAN_APPROVAL_TOKEN = "PLAN_STATUS: approved"
 PLAN_CHANGES_TOKEN = "PLAN_STATUS: changes_requested"
 REVIEW_CHANGES_TOKEN = "REVIEW_STATUS: changes_requested"
 AGENTS = ("claude", "codex")
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def env_default(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return value
 
 
 @dataclass
@@ -645,6 +654,15 @@ def run_gh_review_loop(
 
 
 def main() -> int:
+    default_codex_model = env_default("A2A_CODEX_MODEL")
+    default_codex_effort = env_default("A2A_CODEX_EFFORT")
+    default_claude_model = env_default("A2A_CLAUDE_MODEL")
+    default_claude_effort = env_default("A2A_CLAUDE_EFFORT")
+    if default_claude_effort and default_claude_effort not in CLAUDE_EFFORTS:
+        raise SystemExit(
+            "A2A_CLAUDE_EFFORT must be one of: " + ", ".join(CLAUDE_EFFORTS)
+        )
+
     parser = argparse.ArgumentParser(
         description="Run a bounded Codex <-> Claude PR loop.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -665,10 +683,27 @@ def main() -> int:
     parser.add_argument("--planner", choices=AGENTS, default="claude", help="Agent used to create new plans.")
     parser.add_argument("--implementer", choices=AGENTS, default="codex", help="Agent used to review plans, implement, and fix.")
     parser.add_argument("--reviewer", choices=AGENTS, default="claude", help="Agent used to approve plans and review implementations.")
-    parser.add_argument("--codex-model", default="gpt-5.5", help="Model passed to codex exec.")
-    parser.add_argument("--codex-effort", default="extra-high", help="Codex reasoning effort config value.")
-    parser.add_argument("--claude-model", default="claude-fable-5", help="Model passed to claude.")
-    parser.add_argument("--claude-effort", choices=["low", "medium", "high", "xhigh", "max"], help="Optional effort passed to claude.")
+    parser.add_argument(
+        "--codex-model",
+        default=default_codex_model,
+        help="Model passed to codex exec. Can also be set with A2A_CODEX_MODEL.",
+    )
+    parser.add_argument(
+        "--codex-effort",
+        default=default_codex_effort,
+        help="Codex reasoning effort config value. Can also be set with A2A_CODEX_EFFORT.",
+    )
+    parser.add_argument(
+        "--claude-model",
+        default=default_claude_model,
+        help="Model passed to claude. Can also be set with A2A_CLAUDE_MODEL.",
+    )
+    parser.add_argument(
+        "--claude-effort",
+        choices=CLAUDE_EFFORTS,
+        default=default_claude_effort,
+        help="Optional effort passed to claude. Can also be set with A2A_CLAUDE_EFFORT.",
+    )
     parser.add_argument("--gh-review", action="store_true", help="Use GitHub PR comments as the review surface.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--merge", action="store_true", help="Squash merge after reviewer approval.")

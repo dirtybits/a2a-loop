@@ -2,6 +2,10 @@
 
 Headless Codex <-> Claude Code workflow coordinator.
 
+> Experimental: this can create branches, run agents, commit changes, push PRs,
+> and optionally merge. Start with `--dry-run`, use disposable worktrees or
+> clean branches, and inspect generated plans/reviews before trusting a run.
+
 The loop uses local git state and `.a2a/` files as the default coordination
 layer, then opens or updates a GitHub PR only after Claude approves the local
 diff:
@@ -32,7 +36,8 @@ wrapper on your `PATH`:
 
 ```bash
 mkdir -p ~/.local/bin
-ln -s /Users/andy/Repos/a2a-loop/bin/a2a-loop ~/.local/bin/a2a-loop
+git clone https://github.com/YOUR_GITHUB_USERNAME/a2a-loop.git ~/src/a2a-loop
+ln -s ~/src/a2a-loop/bin/a2a-loop ~/.local/bin/a2a-loop
 ```
 
 Make sure `~/.local/bin` is on your shell `PATH`. After that, run the loop from
@@ -73,7 +78,8 @@ without reloading the full project context.
 Install it by symlinking the repo-local skill into your shared skills root:
 
 ```bash
-ln -s /Users/andy/Repos/a2a-loop/skills/a2a-loop /Users/andy/.agents/skills/a2a-loop
+mkdir -p ~/.agents/skills
+ln -s ~/src/a2a-loop/skills/a2a-loop ~/.agents/skills/a2a-loop
 ```
 
 After that, future Codex sessions can invoke `$a2a-loop` as procedural guidance
@@ -134,17 +140,38 @@ a2a-loop \
   --dry-run
 ```
 
-Default model settings:
+By default, `a2a-loop` does not force model names. It lets each CLI use its own
+configured default. Override models and effort per run:
+
+```bash
+a2a-loop \
+  --goal "Implement the feature..." \
+  --codex-model gpt-5.5 \
+  --codex-effort extra-high \
+  --claude-model claude-fable-5 \
+  --dry-run
+```
+
+Or set environment variables:
+
+```bash
+export A2A_CODEX_MODEL=gpt-5.5
+export A2A_CODEX_EFFORT=extra-high
+export A2A_CLAUDE_MODEL=claude-fable-5
+```
+
+Available model-related flags:
 
 ```text
 --codex-model gpt-5.5
 --codex-effort extra-high
 --claude-model claude-fable-5
+--claude-effort high
 ```
 
-Claude effort is left to the Claude CLI default unless `--claude-effort` is
-passed. Supported Claude effort values are `low`, `medium`, `high`, `xhigh`,
-and `max`.
+Claude effort is left to the Claude CLI default unless `--claude-effort` or
+`A2A_CLAUDE_EFFORT` is set. Supported Claude effort values are `low`, `medium`,
+`high`, `xhigh`, and `max`.
 
 The script shells out to three CLIs:
 
@@ -202,8 +229,13 @@ Add `--plan path/to/file.plan.md` when you already have a plan to execute.
 
 - Run on a clean branch or disposable worktree.
 - `.a2a/` is ignored by default because it is local working memory.
+- `a2a-logs/` is ignored by default because it contains run logs.
 - Keep `--max-plan-rounds` bounded.
 - Keep `--max-rounds` bounded.
 - Do not pass `--merge` until the dry-run and prompt contract look right.
 - The coordinator fails closed unless Claude emits `MERGE_DECISION: APPROVE`.
 - Logs are written to `a2a-logs/<timestamp>/run.log`.
+
+## License
+
+MIT
