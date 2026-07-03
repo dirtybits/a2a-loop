@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""
+Run the a2a-loop coordinator from a PATH-friendly command.
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import sys
+
+
+def main() -> None:
+    script = pathlib.Path(__file__).resolve().parents[1] / "a2a-loop.py"
+    os.execv(sys.executable, [sys.executable, str(script), *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    main()

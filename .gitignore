@@ -3,5 +3,5 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.a2a/
 a2a-logs/
-

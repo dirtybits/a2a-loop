@@ -1,0 +1,4 @@
+interface:
+  display_name: "a2a-loop"
+  short_description: "Run Codex and Claude local PR loops"
+  default_prompt: "Use $a2a-loop to run a dry-run local Codex and Claude review loop for this repo."
