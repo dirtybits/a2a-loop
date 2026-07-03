@@ -19,7 +19,32 @@ a2a-loop --goal "Implement the feature..." --base main --max-plan-rounds 2 --max
 
 3. For a real local-first run, remove `--dry-run`.
 4. Pass `--repo /path/to/repo` only when running from outside the target project.
-5. Pass `--merge` only when the user explicitly wants the coordinator to squash-merge after Claude emits `MERGE_DECISION: APPROVE`.
+5. Pass `--merge` only when the user explicitly wants the coordinator to squash-merge after the reviewer emits `MERGE_DECISION: APPROVE`.
+
+## Existing Plans
+
+When the user already has a plan such as `phase-9.plan.md`, prefer first-class
+plan execution over turning the filename into a vague goal:
+
+```bash
+a2a-loop --plan phase-9.plan.md --dry-run
+```
+
+Add `--goal "..."` only when useful as supplemental intent. Use
+`--skip-plan-review` only when the user explicitly wants to bypass implementer
+plan review and reviewer approval.
+
+## Plan Files
+
+Use `$plan-writing` (`dirtybits/agent-skills/plan-writing`) for generated and
+reviewed `.plan.md` files. The a2a coordinator stores working plans under
+`.a2a/plans/`, but they should still follow the plan-writing convention:
+
+- YAML frontmatter with `name`, `overview`, `todos`, and `isProject`.
+- Todo ids that are stable, lowercase, and hyphenated.
+- Todo statuses of `pending`, `in_progress`, or `completed`.
+- Concrete files, commands, verification gates, and blockers.
+- Updated statuses/body when implementation diverges from the original plan.
 
 ## Review Modes
 
@@ -36,6 +61,21 @@ comments as scratch space:
 
 Use `--gh-review` only when the user wants GitHub PR comments to be the review
 surface before approval.
+
+## Roles and Models
+
+Keep the default split unless the user asks otherwise:
+
+```text
+--planner claude
+--implementer codex
+--reviewer claude
+```
+
+Supported role values are `claude` and `codex`. Default model settings are
+`--codex-model gpt-5.5`, `--codex-effort extra-high`, and
+`--claude-model claude-fable-5`. Claude effort is left to the Claude CLI default
+unless `--claude-effort low|medium|high|xhigh|max` is passed.
 
 ## Safety Defaults
 

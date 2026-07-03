@@ -15,6 +15,9 @@ diff:
 7. Claude approves with `MERGE_DECISION: APPROVE`.
 8. The coordinator pushes, opens or updates a PR, and can squash-merge when `--merge` is passed.
 
+Those are the defaults. You can also choose `claude` or `codex` for the
+planner, implementer, and reviewer roles.
+
 ## Requirements
 
 - `codex` CLI with `codex exec`
@@ -50,6 +53,14 @@ want to run the command from somewhere else:
 a2a-loop \
   --repo /path/to/repo \
   --goal "Implement the feature..." \
+  --dry-run
+```
+
+To execute an existing plan instead of creating one:
+
+```bash
+a2a-loop \
+  --plan phase-9.plan.md \
   --dry-run
 ```
 
@@ -94,9 +105,46 @@ At a high level:
 9. If Claude emits `MERGE_DECISION: APPROVE`, the coordinator pushes and opens or updates a PR.
 10. If `--merge` was passed, the coordinator squash-merges the PR.
 
+If `--plan path/to/existing.plan.md` is passed, the coordinator skips initial
+plan creation and uses that file in place. It still runs implementer plan review
+and reviewer plan approval unless `--skip-plan-review` is passed.
+
 Use `--gh-review` when you explicitly want the older GitHub PR review surface.
 In that mode, the coordinator pushes and opens or updates the PR before review,
 Claude reviews the PR, and Codex pushes fixes back to the branch.
+
+## Roles and Models
+
+Default roles:
+
+```text
+--planner claude
+--implementer codex
+--reviewer claude
+```
+
+You can switch any role to `claude` or `codex`:
+
+```bash
+a2a-loop \
+  --plan phase-9.plan.md \
+  --planner codex \
+  --implementer codex \
+  --reviewer claude \
+  --dry-run
+```
+
+Default model settings:
+
+```text
+--codex-model gpt-5.5
+--codex-effort extra-high
+--claude-model claude-fable-5
+```
+
+Claude effort is left to the Claude CLI default unless `--claude-effort` is
+passed. Supported Claude effort values are `low`, `medium`, `high`, `xhigh`,
+and `max`.
 
 The script shells out to three CLIs:
 
@@ -145,9 +193,10 @@ Always start with `--dry-run`:
   --max-rounds 3
 ```
 
-Add `--merge` only when you want the coordinator to squash-merge after Claude emits the exact approval token.
+Add `--merge` only when you want the coordinator to squash-merge after the reviewer emits the exact approval token.
 Add `--gh-review` when you want Claude and Codex to coordinate through GitHub
 PR comments instead of local review files.
+Add `--plan path/to/file.plan.md` when you already have a plan to execute.
 
 ## Safety
 

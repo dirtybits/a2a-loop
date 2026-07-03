@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Headless Codex <-> Claude Code PR loop.
+Headless agent-to-agent PR loop for Codex and Claude Code.
 
-Claude plans and reviews. Codex critiques, implements, and fixes. Local git
-state plus `.a2a/` files are the default coordination layer; GitHub PR review
-is available with --gh-review. Start with --dry-run.
+By default, Claude plans/reviews and Codex critiques/implements/fixes. Local
+git state plus `.a2a/` files are the default coordination layer; GitHub PR
+review is available with --gh-review. Start with --dry-run.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ APPROVAL_TOKEN = "MERGE_DECISION: APPROVE"
 PLAN_APPROVAL_TOKEN = "PLAN_STATUS: approved"
 PLAN_CHANGES_TOKEN = "PLAN_STATUS: changes_requested"
 REVIEW_CHANGES_TOKEN = "REVIEW_STATUS: changes_requested"
+AGENTS = ("claude", "codex")
 
 
 @dataclass
@@ -69,17 +70,30 @@ def require_ok(result: CmdResult, context: str) -> None:
         raise SystemExit(f"{context} failed ({result.returncode}): {rendered}\n{result.stderr}")
 
 
-def claude_print(prompt: str, repo: pathlib.Path, dry_run: bool, log: pathlib.Path) -> str:
+def claude_print(
+    prompt: str,
+    repo: pathlib.Path,
+    dry_run: bool,
+    log: pathlib.Path,
+    model: str | None,
+    effort: str | None,
+) -> str:
+    args = [
+        "claude",
+        "-p",
+        "--permission-mode",
+        "dontAsk",
+        "--output-format",
+        "text",
+    ]
+    if model:
+        args.extend(["--model", model])
+    if effort:
+        args.extend(["--effort", effort])
+    args.append(prompt)
+
     result = run(
-        [
-            "claude",
-            "-p",
-            "--permission-mode",
-            "dontAsk",
-            "--output-format",
-            "text",
-            prompt,
-        ],
+        args,
         cwd=repo,
         dry_run=dry_run,
         log_file=log,
@@ -88,25 +102,56 @@ def claude_print(prompt: str, repo: pathlib.Path, dry_run: bool, log: pathlib.Pa
     return result.stdout
 
 
-def codex_exec(prompt: str, repo: pathlib.Path, dry_run: bool, log: pathlib.Path) -> str:
+def codex_exec(
+    prompt: str,
+    repo: pathlib.Path,
+    dry_run: bool,
+    log: pathlib.Path,
+    model: str | None,
+    effort: str | None,
+) -> str:
+    args = [
+        "codex",
+        "exec",
+        "-C",
+        str(repo),
+        "--sandbox",
+        "workspace-write",
+        "-c",
+        'approval_policy="never"',
+    ]
+    if model:
+        args.extend(["--model", model])
+    if effort:
+        args.extend(["-c", f'model_reasoning_effort="{effort}"'])
+    args.append(prompt)
+
     result = run(
-        [
-            "codex",
-            "exec",
-            "-C",
-            str(repo),
-            "--sandbox",
-            "workspace-write",
-            "--ask-for-approval",
-            "never",
-            prompt,
-        ],
+        args,
         cwd=repo,
         dry_run=dry_run,
         log_file=log,
     )
     require_ok(result, "Codex turn")
     return result.stdout
+
+
+def run_agent(
+    agent: str,
+    prompt: str,
+    repo: pathlib.Path,
+    dry_run: bool,
+    log: pathlib.Path,
+    codex_model: str | None,
+    codex_effort: str | None,
+    claude_model: str | None,
+    claude_effort: str | None,
+) -> str:
+    if agent == "claude":
+        return claude_print(prompt, repo, dry_run, log, claude_model, claude_effort)
+    if agent == "codex":
+        return codex_exec(prompt, repo, dry_run, log, codex_model, codex_effort)
+    raise ValueError(f"Unsupported agent: {agent}")
 
 
 def gh_json(repo: pathlib.Path, args: list[str], dry_run: bool, log: pathlib.Path) -> dict:
@@ -156,6 +201,18 @@ def read_if_present(path: pathlib.Path, fallback: str = "") -> str:
     return path.read_text(encoding="utf-8")
 
 
+def resolve_repo_path(repo: pathlib.Path, value: pathlib.Path) -> pathlib.Path:
+    path = value.expanduser()
+    if not path.is_absolute():
+        path = repo / path
+    path = path.resolve()
+    try:
+        path.relative_to(repo)
+    except ValueError as exc:
+        raise SystemExit(f"Path must be inside repo {repo}: {path}") from exc
+    return path
+
+
 def open_or_update_pr(
     repo: pathlib.Path,
     base: str,
@@ -184,13 +241,13 @@ def open_or_update_pr(
 
         {goal}
 
-        ## Claude Plan
+        ## Agent Plan
 
         {plan.strip()}
 
         ## Coordination
 
-        This PR was opened by the Codex/Claude headless loop.
+        This PR was opened by the a2a-loop coordinator.
         """
     ).strip()
     return gh_text(
@@ -214,7 +271,7 @@ def open_or_update_pr(
 
 def build_plan_prompt(goal: str, base: str, plan_path: str) -> str:
     return f"""
-You are the planner in a Codex + Claude agent-to-agent workflow.
+You are the planner in an agent-to-agent workflow.
 
 Target goal:
 {goal}
@@ -224,11 +281,13 @@ Base branch: {base}
 Write the implementation plan to:
 {plan_path}
 
-Include:
-1. A concise implementation plan.
-2. Acceptance criteria.
-3. Tests/checks the implementer should run.
-4. Risks or files likely to need attention.
+Use the dirtybits/agent-skills `plan-writing` convention for `.plan.md` files:
+- Start with YAML frontmatter containing `name`, `overview`, `todos`, and `isProject`.
+- Make `todos` a short checklist with stable lowercase hyphenated `id` values,
+  concrete `content`, and `status: pending`.
+- After frontmatter, include Markdown sections for goal, scope, files to change,
+  implementation steps, verification, rollout/rollback if relevant, and blockers.
+- Include enough repo-specific detail that the implementer can proceed without guessing.
 
 Do not edit source files. End your response with PLAN_READY.
 """.strip()
@@ -236,7 +295,7 @@ Do not edit source files. End your response with PLAN_READY.
 
 def build_plan_review_prompt(goal: str, base: str, plan_path: str) -> str:
     return f"""
-You are Codex, reviewing Claude's plan before implementation.
+You are the implementer, reviewing the plan before implementation.
 
 Goal:
 {goal}
@@ -248,7 +307,8 @@ Read the plan at:
 
 Inspect the repo enough to catch missing steps, risky assumptions, weak tests,
 or repo-specific implementation details. Update the plan file in place by
-adding a "Codex Review" or "Codex Enhancements" section.
+adding an "Implementer Review" or "Implementation Enhancements" section. Preserve the
+plan-writing frontmatter shape and keep todo ids stable.
 
 Do not implement the feature yet. End your response with PLAN_REVIEW_READY.
 """.strip()
@@ -256,7 +316,7 @@ Do not implement the feature yet. End your response with PLAN_REVIEW_READY.
 
 def build_plan_approval_prompt(goal: str, base: str, plan_path: str) -> str:
     return f"""
-You are Claude, approving the implementation plan before Codex edits code.
+You are the reviewer/plan gate, approving the implementation plan before code edits begin.
 
 Goal:
 {goal}
@@ -270,7 +330,7 @@ If the plan is ready for implementation, end with exactly:
 {PLAN_APPROVAL_TOKEN}
 
 If changes are still needed, update the plan file in place with a concise
-"Claude Follow-up" section and end with exactly:
+"Reviewer Follow-up" section and end with exactly:
 {PLAN_CHANGES_TOKEN}
 
 Do not implement the feature.
@@ -279,7 +339,7 @@ Do not implement the feature.
 
 def build_implement_prompt(goal: str, plan_path: str, base: str) -> str:
     return f"""
-You are Codex, the implementer in a two-agent workflow.
+You are the implementer in an agent-to-agent workflow.
 
 Goal:
 {goal}
@@ -290,6 +350,8 @@ Plan file:
 Instructions:
 - Read the plan file before editing.
 - Inspect the repo before editing.
+- Maintain plan todo statuses as work progresses: set started todos to
+  `in_progress` and completed, verified todos to `completed`.
 - Implement the smallest complete change that satisfies the plan.
 - Run relevant tests/checks.
 - Commit your changes to the current branch.
@@ -303,7 +365,7 @@ Base branch: {base}
 
 def build_local_review_prompt(goal: str, base: str, plan_path: str, review_path: str) -> str:
     return f"""
-You are Claude, the reviewer/merge gate in a local-first Codex + Claude workflow.
+You are the reviewer/merge gate in a local-first agent-to-agent workflow.
 
 Goal:
 {goal}
@@ -337,7 +399,7 @@ Do not merge, push, or edit source files.
 
 def build_local_fix_prompt(goal: str, base: str, plan_path: str, review_path: str) -> str:
     return f"""
-You are Codex, the fixer in a local-first Codex + Claude workflow.
+You are the fixer in a local-first agent-to-agent workflow.
 
 Goal:
 {goal}
@@ -351,6 +413,7 @@ Review file:
 Instructions:
 - Read the plan and review files.
 - Inspect the local diff against `{base}`.
+- Maintain plan todo statuses as work progresses.
 - Address all actionable review comments.
 - Run relevant tests/checks.
 - Commit fixes to the current branch.
@@ -362,7 +425,7 @@ Instructions:
 
 def build_gh_review_prompt(goal: str, pr_url: str) -> str:
     return f"""
-You are Claude, the reviewer/merge gate in a Codex + Claude workflow.
+You are the reviewer/merge gate in an agent-to-agent workflow.
 
 Goal:
 {goal}
@@ -386,7 +449,7 @@ Do not merge the PR.
 
 def build_gh_fix_prompt(goal: str, pr_url: str, review: str) -> str:
     return f"""
-You are Codex, the fixer in a two-agent workflow.
+You are the fixer in an agent-to-agent workflow.
 
 Goal:
 {goal}
@@ -394,7 +457,7 @@ Goal:
 PR:
 {pr_url}
 
-Claude's review:
+Reviewer output:
 {review}
 
 Instructions:
@@ -412,18 +475,64 @@ def negotiate_plan(
     goal: str,
     base: str,
     plan_path: pathlib.Path,
+    planner: str,
+    implementer: str,
+    reviewer: str,
     max_plan_rounds: int,
+    skip_plan_review: bool,
     dry_run: bool,
     log: pathlib.Path,
+    codex_model: str | None,
+    codex_effort: str | None,
+    claude_model: str | None,
+    claude_effort: str | None,
+    create_plan: bool,
 ) -> str:
     plan_rel = repo_relative(repo, plan_path)
-    print(f"[loop] writing plan: {plan_rel}")
-    claude_print(build_plan_prompt(goal, base, plan_rel), repo, dry_run, log)
+    if create_plan:
+        print(f"[loop] writing plan with {planner}: {plan_rel}")
+        run_agent(
+            planner,
+            build_plan_prompt(goal, base, plan_rel),
+            repo,
+            dry_run,
+            log,
+            codex_model,
+            codex_effort,
+            claude_model,
+            claude_effort,
+        )
+    else:
+        print(f"[loop] using existing plan: {plan_rel}")
+
+    if skip_plan_review:
+        print("[loop] plan review skipped")
+        return read_if_present(plan_path, "DRY_RUN_PLAN")
 
     for round_index in range(1, max_plan_rounds + 1):
         print(f"[loop] plan review round {round_index}/{max_plan_rounds}")
-        codex_exec(build_plan_review_prompt(goal, base, plan_rel), repo, dry_run, log)
-        approval = claude_print(build_plan_approval_prompt(goal, base, plan_rel), repo, dry_run, log)
+        run_agent(
+            implementer,
+            build_plan_review_prompt(goal, base, plan_rel),
+            repo,
+            dry_run,
+            log,
+            codex_model,
+            codex_effort,
+            claude_model,
+            claude_effort,
+        )
+        approval = run_agent(
+            reviewer,
+            build_plan_approval_prompt(goal, base, plan_rel),
+            repo,
+            dry_run,
+            log,
+            codex_model,
+            codex_effort,
+            claude_model,
+            claude_effort,
+        )
         if dry_run:
             approval = PLAN_APPROVAL_TOKEN
         if PLAN_APPROVAL_TOKEN in approval:
@@ -437,27 +546,48 @@ def run_local_review_loop(
     goal: str,
     base: str,
     plan_path: pathlib.Path,
+    reviewer: str,
+    implementer: str,
     max_rounds: int,
     dry_run: bool,
     log: pathlib.Path,
+    codex_model: str | None,
+    codex_effort: str | None,
+    claude_model: str | None,
+    claude_effort: str | None,
 ) -> bool:
     plan_rel = repo_relative(repo, plan_path)
     for round_index in range(1, max_rounds + 1):
         review_path = repo / ".a2a" / "reviews" / f"review-{round_index}.md"
         review_rel = repo_relative(repo, review_path)
-        print(f"[loop] local review round {round_index}/{max_rounds}: {review_rel}")
-        review = claude_print(
+        print(f"[loop] local review round {round_index}/{max_rounds} with {reviewer}: {review_rel}")
+        review = run_agent(
+            reviewer,
             build_local_review_prompt(goal, base, plan_rel, review_rel),
             repo,
             dry_run,
             log,
+            codex_model,
+            codex_effort,
+            claude_model,
+            claude_effort,
         )
         if dry_run:
             review = APPROVAL_TOKEN
         if APPROVAL_TOKEN in review:
             return True
 
-        codex_exec(build_local_fix_prompt(goal, base, plan_rel, review_rel), repo, dry_run, log)
+        run_agent(
+            implementer,
+            build_local_fix_prompt(goal, base, plan_rel, review_rel),
+            repo,
+            dry_run,
+            log,
+            codex_model,
+            codex_effort,
+            claude_model,
+            claude_effort,
+        )
 
     return False
 
@@ -466,21 +596,47 @@ def run_gh_review_loop(
     repo: pathlib.Path,
     goal: str,
     pr_url: str,
+    reviewer: str,
+    implementer: str,
     max_rounds: int,
     dry_run: bool,
     log: pathlib.Path,
+    codex_model: str | None,
+    codex_effort: str | None,
+    claude_model: str | None,
+    claude_effort: str | None,
 ) -> bool:
     for round_index in range(1, max_rounds + 1):
-        print(f"[loop] GitHub review round {round_index}/{max_rounds}")
-        review = claude_print(build_gh_review_prompt(goal, pr_url), repo, dry_run, log)
+        print(f"[loop] GitHub review round {round_index}/{max_rounds} with {reviewer}")
+        review = run_agent(
+            reviewer,
+            build_gh_review_prompt(goal, pr_url),
+            repo,
+            dry_run,
+            log,
+            codex_model,
+            codex_effort,
+            claude_model,
+            claude_effort,
+        )
         if dry_run:
             review = APPROVAL_TOKEN
         if APPROVAL_TOKEN in review:
             return True
-        codex_exec(build_gh_fix_prompt(goal, pr_url, review), repo, dry_run, log)
+        run_agent(
+            implementer,
+            build_gh_fix_prompt(goal, pr_url, review),
+            repo,
+            dry_run,
+            log,
+            codex_model,
+            codex_effort,
+            claude_model,
+            claude_effort,
+        )
         gh_text(
             repo,
-            ["pr", "comment", pr_url, "--body", f"Codex pushed fixes for round {round_index}."],
+            ["pr", "comment", pr_url, "--body", f"Implementer pushed fixes for round {round_index}."],
             dry_run,
             log,
         )
@@ -489,76 +645,124 @@ def run_gh_review_loop(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a bounded Codex <-> Claude PR loop.")
+    parser = argparse.ArgumentParser(
+        description="Run a bounded Codex <-> Claude PR loop.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
         "--repo",
         default=pathlib.Path("."),
         type=pathlib.Path,
         help="Target repo to operate on. Defaults to the current directory.",
     )
-    parser.add_argument("--goal", required=True)
-    parser.add_argument("--base", default="main")
-    parser.add_argument("--branch")
-    parser.add_argument("--max-plan-rounds", type=int, default=2)
+    parser.add_argument("--goal", help="Goal to plan and implement. Optional when --plan is passed.")
+    parser.add_argument("--plan", type=pathlib.Path, help="Use an existing .plan.md file instead of creating one.")
+    parser.add_argument("--base", default="main", help="Base branch for diff review and PR creation.")
+    parser.add_argument("--branch", help="Branch to create/use. Defaults to a timestamped a2a/* branch.")
+    parser.add_argument("--max-plan-rounds", type=int, default=2, help="Maximum plan negotiation rounds.")
     parser.add_argument("--max-rounds", type=int, default=3, help="Maximum implementation review rounds.")
+    parser.add_argument("--skip-plan-review", action="store_true", help="Use the plan without implementer/reviewer negotiation.")
+    parser.add_argument("--planner", choices=AGENTS, default="claude", help="Agent used to create new plans.")
+    parser.add_argument("--implementer", choices=AGENTS, default="codex", help="Agent used to review plans, implement, and fix.")
+    parser.add_argument("--reviewer", choices=AGENTS, default="claude", help="Agent used to approve plans and review implementations.")
+    parser.add_argument("--codex-model", default="gpt-5.5", help="Model passed to codex exec.")
+    parser.add_argument("--codex-effort", default="extra-high", help="Codex reasoning effort config value.")
+    parser.add_argument("--claude-model", default="claude-fable-5", help="Model passed to claude.")
+    parser.add_argument("--claude-effort", choices=["low", "medium", "high", "xhigh", "max"], help="Optional effort passed to claude.")
     parser.add_argument("--gh-review", action="store_true", help="Use GitHub PR comments as the review surface.")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--merge", action="store_true", help="Squash merge after Claude approval.")
+    parser.add_argument("--merge", action="store_true", help="Squash merge after reviewer approval.")
     args = parser.parse_args()
 
     repo = args.repo.expanduser().resolve()
     if not repo.exists():
         raise SystemExit(f"Repo does not exist: {repo}")
+    if not args.goal and not args.plan:
+        raise SystemExit("Either --goal or --plan is required.")
 
     stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
     branch = args.branch or f"a2a/{stamp}"
     log_dir = pathlib.Path.cwd() / "a2a-logs" / stamp
     log = log_dir / "run.log"
-    plan_path = repo / ".a2a" / "plans" / f"{slugify_goal(args.goal)}.plan.md"
+    goal = args.goal
+    if args.plan:
+        plan_path = resolve_repo_path(repo, args.plan)
+        if not plan_path.exists():
+            raise SystemExit(f"Plan does not exist: {plan_path}")
+        goal = goal or f"Execute plan {repo_relative(repo, plan_path)}"
+    else:
+        assert goal is not None
+        plan_path = repo / ".a2a" / "plans" / f"{slugify_goal(goal)}.plan.md"
 
     ensure_a2a_dirs(repo, args.dry_run)
     ensure_branch(repo, branch, args.dry_run, log)
 
     plan = negotiate_plan(
         repo,
-        args.goal,
+        goal,
         args.base,
         plan_path,
+        args.planner,
+        args.implementer,
+        args.reviewer,
         args.max_plan_rounds,
+        args.skip_plan_review,
         args.dry_run,
         log,
+        args.codex_model,
+        args.codex_effort,
+        args.claude_model,
+        args.claude_effort,
+        create_plan=args.plan is None,
     )
 
-    codex_exec(
-        build_implement_prompt(args.goal, repo_relative(repo, plan_path), args.base),
+    run_agent(
+        args.implementer,
+        build_implement_prompt(goal, repo_relative(repo, plan_path), args.base),
         repo,
         args.dry_run,
         log,
+        args.codex_model,
+        args.codex_effort,
+        args.claude_model,
+        args.claude_effort,
     )
 
     pr_url = ""
     if args.gh_review:
-        pr_url = open_or_update_pr(repo, args.base, branch, args.goal, plan, args.dry_run, log)
+        pr_url = open_or_update_pr(repo, args.base, branch, goal, plan, args.dry_run, log)
         approved = run_gh_review_loop(
             repo,
-            args.goal,
+            goal,
             pr_url,
+            args.reviewer,
+            args.implementer,
             args.max_rounds,
             args.dry_run,
             log,
+            args.codex_model,
+            args.codex_effort,
+            args.claude_model,
+            args.claude_effort,
         )
     else:
         approved = run_local_review_loop(
             repo,
-            args.goal,
+            goal,
             args.base,
             plan_path,
+            args.reviewer,
+            args.implementer,
             args.max_rounds,
             args.dry_run,
             log,
+            args.codex_model,
+            args.codex_effort,
+            args.claude_model,
+            args.claude_effort,
         )
         if approved:
-            pr_url = open_or_update_pr(repo, args.base, branch, args.goal, plan, args.dry_run, log)
+            pr_url = open_or_update_pr(repo, args.base, branch, goal, plan, args.dry_run, log)
 
     if not approved:
         pr_note = f" PR: {pr_url}" if pr_url else ""
@@ -566,7 +770,7 @@ def main() -> int:
         print(f"[logs] {log}")
         return 2
 
-    print(f"[done] approved by Claude. PR: {pr_url}")
+    print(f"[done] approved by {args.reviewer}. PR: {pr_url}")
     if args.merge:
         gh_text(repo, ["pr", "merge", pr_url, "--squash", "--delete-branch"], args.dry_run, log)
         print("[done] squash merge requested")
