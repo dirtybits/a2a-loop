@@ -72,16 +72,19 @@ Keep the default split unless the user asks otherwise:
 --reviewer claude
 ```
 
-Supported role values are `claude` and `codex`. By default, `a2a-loop` lets the
-Codex and Claude CLIs use their configured model defaults. Override per run
-with `--codex-model`, `--codex-effort`, `--claude-model`, and
-`--claude-effort`, or use `A2A_CODEX_MODEL`, `A2A_CODEX_EFFORT`,
-`A2A_CLAUDE_MODEL`, and `A2A_CLAUDE_EFFORT`. Codex effort supports
-`minimal|low|medium|high`; compatibility aliases `extra-high`, `xhigh`, and
-`max` map to `high`. Claude effort supports `low|medium|high|xhigh|max`.
-Claude uses local claude.ai login/subscription auth by default; pass
-`--claude-use-api-key` or set `A2A_CLAUDE_USE_API_KEY=1` only when API-key
-billing is intentional.
+Supported role values are `claude` and `codex`. By default, `a2a-loop` resolves
+concrete model and effort values before the run starts, prints each value with
+its source, and shows them in every `[agent:<agent>:<model>:<effort>]` trace
+line. Codex defaults come from `~/.codex/config.toml`; Claude defaults come from
+`~/.claude/settings.json`, with Claude effort falling back to the coordinator
+default `high` when the settings file does not expose one. Override per run with
+`--codex-model`, `--codex-effort`, `--claude-model`, and `--claude-effort`, or use
+`A2A_CODEX_MODEL`, `A2A_CODEX_EFFORT`, `A2A_CLAUDE_MODEL`, and
+`A2A_CLAUDE_EFFORT`. Codex effort supports `minimal|low|medium|high`;
+compatibility aliases `extra-high`, `xhigh`, and `max` map to `high`. Claude
+effort supports `low|medium|high|xhigh|max`. Claude uses local claude.ai
+login/subscription auth by default; pass `--claude-use-api-key` or set
+`A2A_CLAUDE_USE_API_KEY=1` only when API-key billing is intentional.
 
 ## Safety Defaults
 
@@ -90,7 +93,10 @@ billing is intentional.
 - Keep `--max-plan-rounds` and `--max-rounds` bounded.
 - Prefer a clean branch or disposable worktree for target projects.
 - Do not merge unless the exact `MERGE_DECISION: APPROVE` token appears.
-- Watch the terminal for agent step, handoff, approval, PR, and merge status.
+- Watch the terminal for defaults, artifact paths, agent step, handoff,
+  approval, PR, and merge status.
+- Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the writable
+  run ledger so agent sandboxes can update todo statuses.
 - Inspect `.a2a/logs/<timestamp>/run.log`, `.a2a/plans/`, and `.a2a/reviews/`
   when debugging a run.
 - Local review stdout is persisted to `.a2a/reviews/review-N.md` if the

@@ -21,6 +21,11 @@ import sys
 import textwrap
 from dataclasses import asdict, dataclass
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    tomllib = None
+
 
 APPROVAL_TOKEN = "MERGE_DECISION: APPROVE"
 PLAN_APPROVAL_TOKEN = "PLAN_STATUS: approved"
@@ -42,6 +47,9 @@ CLAUDE_API_AUTH_ENV_VARS = (
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
 )
+CLAUDE_DEFAULT_EFFORT = "high"
+CODEX_CONFIG_SOURCE = "~/.codex/config.toml"
+CLAUDE_SETTINGS_SOURCE = "~/.claude/settings.json"
 AGENT_FATAL_PATTERNS = (
     "ERROR: unexpected status",
     "unexpected status 400 Bad Request",
@@ -61,6 +69,26 @@ def env_flag(name: str) -> bool:
     return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def arg_was_passed(option: str) -> bool:
+    return any(arg == option or arg.startswith(f"{option}=") for arg in sys.argv[1:])
+
+
+def resolved_source(
+    option: str,
+    env_name: str,
+    config_value: str | None,
+    config_source: str,
+    fallback_source: str | None = None,
+) -> str:
+    if arg_was_passed(option):
+        return option
+    if env_default(env_name):
+        return env_name
+    if config_value:
+        return config_source
+    return fallback_source or "unresolved"
+
+
 def normalize_codex_effort(value: str | None) -> str | None:
     if value is None:
         return None
@@ -73,6 +101,57 @@ def normalize_codex_effort(value: str | None) -> str | None:
             + ". Note: xhigh/max are Claude effort names and map to Codex high."
         )
     return normalized
+
+
+def sanitize_display_value(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", value)
+    cleaned = re.sub(r"\[[0-9;]*m\]?$", "", cleaned)
+    cleaned = cleaned.strip()
+    return cleaned or None
+
+
+def read_codex_cli_defaults() -> tuple[str | None, str | None]:
+    path = pathlib.Path.home() / ".codex" / "config.toml"
+    if not path.exists():
+        return None, None
+    if tomllib is None:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            return None, None
+        model = read_simple_toml_string(raw, "model")
+        effort = read_simple_toml_string(raw, "model_reasoning_effort")
+        return model, normalize_codex_effort(effort)
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None, None
+    model = sanitize_display_value(data.get("model"))
+    effort = sanitize_display_value(data.get("model_reasoning_effort"))
+    return model, normalize_codex_effort(effort)
+
+
+def read_simple_toml_string(raw: str, key: str) -> str | None:
+    pattern = rf"(?m)^\s*{re.escape(key)}\s*=\s*(['\"])(.*?)\1\s*(?:#.*)?$"
+    match = re.search(pattern, raw)
+    if not match:
+        return None
+    return sanitize_display_value(match.group(2))
+
+
+def read_claude_cli_defaults() -> tuple[str | None, str | None]:
+    path = pathlib.Path.home() / ".claude" / "settings.json"
+    if not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    model = sanitize_display_value(data.get("model"))
+    effort = sanitize_display_value(data.get("effort"))
+    return model, effort
 
 
 @dataclass
@@ -133,6 +212,7 @@ class RunState:
     base: str
     goal: str
     plan_path: str
+    source_plan_path: str | None
     planner: str
     implementer: str
     reviewer: str
@@ -143,8 +223,16 @@ class RunState:
     merge: bool
     codex_model: str | None
     codex_effort: str | None
+    codex_display_model: str
+    codex_display_effort: str
+    codex_model_source: str
+    codex_effort_source: str
     claude_model: str | None
     claude_effort: str | None
+    claude_display_model: str
+    claude_display_effort: str
+    claude_model_source: str
+    claude_effort_source: str
     log_path: str
     claude_use_api_key: bool = False
     phase: str = "initialized"
@@ -187,6 +275,15 @@ def load_state(path: pathlib.Path) -> RunState:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("version") != STATE_VERSION:
         raise SystemExit(f"Unsupported resume state version in {path}: {data.get('version')}")
+    data.setdefault("source_plan_path", None)
+    data.setdefault("codex_display_model", data.get("codex_model") or "unknown")
+    data.setdefault("codex_display_effort", data.get("codex_effort") or "unknown")
+    data.setdefault("codex_model_source", "legacy checkpoint")
+    data.setdefault("codex_effort_source", "legacy checkpoint")
+    data.setdefault("claude_display_model", data.get("claude_model") or "unknown")
+    data.setdefault("claude_display_effort", data.get("claude_effort") or "unknown")
+    data.setdefault("claude_model_source", "legacy checkpoint")
+    data.setdefault("claude_effort_source", "legacy checkpoint")
     return RunState(**data)
 
 
@@ -339,21 +436,25 @@ def run_agent(
     trace: WorkflowTrace,
     codex_model: str | None,
     codex_effort: str | None,
+    codex_display_model: str,
+    codex_display_effort: str,
     claude_model: str | None,
     claude_effort: str | None,
+    claude_display_model: str,
+    claude_display_effort: str,
     claude_use_api_key: bool,
     artifact: str | None = None,
 ) -> str:
     if agent == "claude":
-        model = claude_model or "default"
-        effort = claude_effort or "default"
+        model = claude_display_model
+        effort = claude_display_effort
         step = trace.start_agent(agent, phase, model, effort, artifact)
         output = claude_print(prompt, repo, dry_run, log, claude_model, claude_effort, claude_use_api_key)
         trace.finish_agent(agent, step, phase, model, effort, output)
         return output
     if agent == "codex":
-        model = codex_model or "default"
-        effort = codex_effort or "default"
+        model = codex_display_model
+        effort = codex_display_effort
         step = trace.start_agent(agent, phase, model, effort, artifact)
         output = codex_exec(prompt, repo, dry_run, log, codex_model, codex_effort)
         trace.finish_agent(agent, step, phase, model, effort, output)
@@ -398,6 +499,70 @@ def slugify_goal(goal: str) -> str:
 
 def repo_relative(repo: pathlib.Path, path: pathlib.Path) -> str:
     return path.relative_to(repo).as_posix()
+
+
+def display_path(repo: pathlib.Path, path: pathlib.Path) -> str:
+    try:
+        return repo_relative(repo, path.resolve())
+    except ValueError:
+        return str(path)
+
+
+def trace_run_defaults(repo: pathlib.Path, plan_path: pathlib.Path, state: RunState, trace: WorkflowTrace) -> None:
+    review_mode = "GitHub PR comments" if state.gh_review else "local review files"
+    trace.event(
+        "defaults: "
+        f"base={state.base}, planner={state.planner}, implementer={state.implementer}, "
+        f"reviewer={state.reviewer}, review={review_mode}, "
+        f"max-plan-rounds={state.max_plan_rounds}, max-rounds={state.max_rounds}"
+    )
+    trace.event(
+        "Codex defaults: "
+        f"model={state.codex_display_model} ({state.codex_model_source}), "
+        f"effort={state.codex_display_effort} ({state.codex_effort_source})"
+    )
+    trace.event(
+        "Claude defaults: "
+        f"model={state.claude_display_model} ({state.claude_model_source}), "
+        f"effort={state.claude_display_effort} ({state.claude_effort_source})"
+    )
+    trace.event(
+        "artifacts: "
+        f"plan={display_path(repo, plan_path)}, "
+        f"state={display_path(repo, state_path(repo, state.run_id))}, "
+        f"log={display_path(repo, pathlib.Path(state.log_path))}"
+    )
+    if state.source_plan_path and state.source_plan_path != state.plan_path:
+        trace.event(f"plan ledger source: {state.source_plan_path}")
+
+
+def plan_is_in_a2a(repo: pathlib.Path, path: pathlib.Path) -> bool:
+    return display_path(repo, path).startswith(".a2a/")
+
+
+def materialize_working_plan(
+    repo: pathlib.Path,
+    source_path: pathlib.Path,
+    run_id: str,
+    dry_run: bool,
+    trace: WorkflowTrace,
+) -> pathlib.Path:
+    if plan_is_in_a2a(repo, source_path):
+        return source_path
+    dest = repo / ".a2a" / "plans" / f"{run_id}-{source_path.name}"
+    if dry_run:
+        trace.event(
+            f"dry-run would copy plan ledger for writable run state: "
+            f"{display_path(repo, source_path)} -> {display_path(repo, dest)}"
+        )
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
+    trace.event(
+        f"copied plan ledger for writable run state: "
+        f"{display_path(repo, source_path)} -> {display_path(repo, dest)}"
+    )
+    return dest
 
 
 def ensure_a2a_dirs(repo: pathlib.Path, dry_run: bool) -> None:
@@ -745,8 +910,12 @@ def negotiate_plan(
                 trace,
                 state.codex_model,
                 state.codex_effort,
+                state.codex_display_model,
+                state.codex_display_effort,
                 state.claude_model,
                 state.claude_effort,
+                state.claude_display_model,
+                state.claude_display_effort,
                 state.claude_use_api_key,
                 artifact=plan_rel,
             )
@@ -780,8 +949,12 @@ def negotiate_plan(
             trace,
             state.codex_model,
             state.codex_effort,
+            state.codex_display_model,
+            state.codex_display_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_display_model,
+            state.claude_display_effort,
             state.claude_use_api_key,
             artifact=plan_rel,
         )
@@ -795,8 +968,12 @@ def negotiate_plan(
             trace,
             state.codex_model,
             state.codex_effort,
+            state.codex_display_model,
+            state.codex_display_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_display_model,
+            state.claude_display_effort,
             state.claude_use_api_key,
             artifact=plan_rel,
         )
@@ -838,8 +1015,12 @@ def run_local_review_loop(
             trace,
             state.codex_model,
             state.codex_effort,
+            state.codex_display_model,
+            state.codex_display_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_display_model,
+            state.claude_display_effort,
             state.claude_use_api_key,
             artifact=review_rel,
         )
@@ -863,8 +1044,12 @@ def run_local_review_loop(
             trace,
             state.codex_model,
             state.codex_effort,
+            state.codex_display_model,
+            state.codex_display_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_display_model,
+            state.claude_display_effort,
             state.claude_use_api_key,
             artifact=review_rel,
         )
@@ -894,8 +1079,12 @@ def run_gh_review_loop(
             trace,
             state.codex_model,
             state.codex_effort,
+            state.codex_display_model,
+            state.codex_display_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_display_model,
+            state.claude_display_effort,
             state.claude_use_api_key,
             artifact=state.pr_url,
         )
@@ -917,8 +1106,12 @@ def run_gh_review_loop(
             trace,
             state.codex_model,
             state.codex_effort,
+            state.codex_display_model,
+            state.codex_display_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_display_model,
+            state.claude_display_effort,
             state.claude_use_api_key,
             artifact=state.pr_url,
         )
@@ -936,14 +1129,16 @@ def run_gh_review_loop(
 
 
 def main() -> int:
-    default_codex_model = env_default("A2A_CODEX_MODEL")
-    default_codex_effort = env_default("A2A_CODEX_EFFORT")
-    default_claude_model = env_default("A2A_CLAUDE_MODEL")
-    default_claude_effort = env_default("A2A_CLAUDE_EFFORT")
+    codex_cli_model, codex_cli_effort = read_codex_cli_defaults()
+    claude_cli_model, claude_cli_effort = read_claude_cli_defaults()
+    default_codex_model = env_default("A2A_CODEX_MODEL") or codex_cli_model
+    default_codex_effort = env_default("A2A_CODEX_EFFORT") or codex_cli_effort
+    default_claude_model = env_default("A2A_CLAUDE_MODEL") or claude_cli_model
+    default_claude_effort = env_default("A2A_CLAUDE_EFFORT") or claude_cli_effort or CLAUDE_DEFAULT_EFFORT
     default_claude_use_api_key = env_flag("A2A_CLAUDE_USE_API_KEY")
     if default_claude_effort and default_claude_effort not in CLAUDE_EFFORTS:
         raise SystemExit(
-            "A2A_CLAUDE_EFFORT must be one of: " + ", ".join(CLAUDE_EFFORTS)
+            "Claude effort must be one of: " + ", ".join(CLAUDE_EFFORTS)
         )
 
     parser = argparse.ArgumentParser(
@@ -999,6 +1194,35 @@ def main() -> int:
     )
     args = parser.parse_args()
     args.codex_effort = normalize_codex_effort(args.codex_effort)
+    codex_display_model = args.codex_model or "unknown"
+    codex_display_effort = args.codex_effort or "unknown"
+    claude_display_model = args.claude_model or "unknown"
+    claude_display_effort = args.claude_effort or "unknown"
+    codex_model_source = resolved_source(
+        "--codex-model",
+        "A2A_CODEX_MODEL",
+        codex_cli_model,
+        CODEX_CONFIG_SOURCE,
+    )
+    codex_effort_source = resolved_source(
+        "--codex-effort",
+        "A2A_CODEX_EFFORT",
+        codex_cli_effort,
+        CODEX_CONFIG_SOURCE,
+    )
+    claude_model_source = resolved_source(
+        "--claude-model",
+        "A2A_CLAUDE_MODEL",
+        claude_cli_model,
+        CLAUDE_SETTINGS_SOURCE,
+    )
+    claude_effort_source = resolved_source(
+        "--claude-effort",
+        "A2A_CLAUDE_EFFORT",
+        claude_cli_effort,
+        CLAUDE_SETTINGS_SOURCE,
+        "coordinator default",
+    )
 
     initial_repo = args.repo.expanduser().resolve()
     if not initial_repo.exists():
@@ -1039,11 +1263,14 @@ def main() -> int:
         log = log_dir / "run.log"
         trace = WorkflowTrace(log)
         goal = args.goal
+        source_plan_path = None
         if args.plan:
             plan_path = resolve_repo_path(repo, args.plan)
             if not plan_path.exists():
                 raise SystemExit(f"Plan does not exist: {plan_path}")
             goal = goal or f"Execute plan {repo_relative(repo, plan_path)}"
+            source_plan_path = repo_relative(repo, plan_path)
+            plan_path = materialize_working_plan(repo, plan_path, stamp, args.dry_run, trace)
             create_plan = False
         else:
             assert goal is not None
@@ -1057,6 +1284,7 @@ def main() -> int:
             base=args.base,
             goal=goal,
             plan_path=repo_relative(repo, plan_path),
+            source_plan_path=source_plan_path,
             planner=args.planner,
             implementer=args.implementer,
             reviewer=args.reviewer,
@@ -1067,8 +1295,16 @@ def main() -> int:
             merge=args.merge,
             codex_model=args.codex_model,
             codex_effort=args.codex_effort,
+            codex_display_model=codex_display_model,
+            codex_display_effort=codex_display_effort,
+            codex_model_source=codex_model_source,
+            codex_effort_source=codex_effort_source,
             claude_model=args.claude_model,
             claude_effort=args.claude_effort,
+            claude_display_model=claude_display_model,
+            claude_display_effort=claude_display_effort,
+            claude_model_source=claude_model_source,
+            claude_effort_source=claude_effort_source,
             claude_use_api_key=args.claude_use_api_key,
             log_path=str(log),
         )
@@ -1079,6 +1315,7 @@ def main() -> int:
         "Claude auth: "
         + ("API key env inherited" if state.claude_use_api_key else "claude.ai login/subscription")
     )
+    trace_run_defaults(repo, plan_path, state, trace)
     ensure_gitignore(repo, args.dry_run, trace)
     if args.resume:
         trace.event(f"branch checkout: {state.branch}")
@@ -1109,8 +1346,12 @@ def main() -> int:
             trace,
             state.codex_model,
             state.codex_effort,
+            state.codex_display_model,
+            state.codex_display_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_display_model,
+            state.claude_display_effort,
             state.claude_use_api_key,
             artifact=repo_relative(repo, plan_path),
         )

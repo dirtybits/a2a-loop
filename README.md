@@ -140,8 +140,12 @@ a2a-loop \
   --dry-run
 ```
 
-By default, `a2a-loop` does not force model names. It lets each CLI use its own
-configured default. Override models and effort per run:
+By default, `a2a-loop` resolves concrete model and effort defaults before the
+run starts, prints each value with its source, and uses those values in every
+`[agent:<agent>:<model>:<effort>]` trace line. Codex defaults come from
+`~/.codex/config.toml`; Claude defaults come from `~/.claude/settings.json`,
+with Claude effort falling back to `high` when the settings file does not expose
+one. Override models and effort per run:
 
 ```bash
 a2a-loop \
@@ -169,14 +173,14 @@ Available model-related flags:
 --claude-effort high
 ```
 
-Codex effort is left to the Codex CLI default unless `--codex-effort` or
-`A2A_CODEX_EFFORT` is set. Supported Codex effort values are `minimal`, `low`,
-`medium`, and `high`. For compatibility, `extra-high`, `xhigh`, and `max` map
-to Codex `high`.
+Codex effort resolves from `A2A_CODEX_EFFORT`, then
+`model_reasoning_effort` in `~/.codex/config.toml`. Supported Codex effort
+values are `minimal`, `low`, `medium`, and `high`. For compatibility,
+`extra-high`, `xhigh`, and `max` map to Codex `high`.
 
-Claude effort is left to the Claude CLI default unless `--claude-effort` or
-`A2A_CLAUDE_EFFORT` is set. Supported Claude effort values are `low`, `medium`,
-`high`, `xhigh`, and `max`.
+Claude effort resolves from `A2A_CLAUDE_EFFORT`, then `effort` in
+`~/.claude/settings.json`, then the coordinator default `high`. Supported
+Claude effort values are `low`, `medium`, `high`, `xhigh`, and `max`.
 
 By default, `a2a-loop` runs Claude through the local `claude` login/subscription
 auth path by stripping API-key auth environment variables from Claude
@@ -264,7 +268,10 @@ another bounded batch of rounds instead of restarting at `review-1.md`.
 - Keep `--max-rounds` bounded.
 - Do not pass `--merge` until the dry-run and prompt contract look right.
 - The coordinator fails closed unless Claude emits `MERGE_DECISION: APPROVE`.
-- The terminal shows each agent step, handoff, approval, PR, and merge action.
+- The terminal shows defaults, artifact paths, agent steps, handoffs, approval,
+  PR, and merge actions.
+- Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the writable
+  run ledger so agent sandboxes can update todo statuses.
 - Logs are written to `.a2a/logs/<timestamp>/run.log` with the same status
   breadcrumbs plus raw commands and agent output.
 - Local review stdout is persisted to `.a2a/reviews/review-N.md` if the reviewer
