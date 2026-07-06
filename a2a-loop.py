@@ -19,7 +19,7 @@ import shlex
 import subprocess
 import sys
 import textwrap
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 
 APPROVAL_TOKEN = "MERGE_DECISION: APPROVE"
@@ -27,6 +27,7 @@ PLAN_APPROVAL_TOKEN = "PLAN_STATUS: approved"
 PLAN_CHANGES_TOKEN = "PLAN_STATUS: changes_requested"
 REVIEW_CHANGES_TOKEN = "REVIEW_STATUS: changes_requested"
 AGENTS = ("claude", "codex")
+STATE_VERSION = 1
 CODEX_EFFORTS = ("minimal", "low", "medium", "high")
 CODEX_EFFORT_ALIASES = {
     "extra-high": "high",
@@ -97,6 +98,71 @@ class WorkflowTrace:
         self.log.parent.mkdir(parents=True, exist_ok=True)
         with self.log.open("a", encoding="utf-8") as f:
             f.write(f"{line}\n")
+
+
+@dataclass
+class RunState:
+    version: int
+    run_id: str
+    repo: str
+    branch: str
+    base: str
+    goal: str
+    plan_path: str
+    planner: str
+    implementer: str
+    reviewer: str
+    max_plan_rounds: int
+    max_rounds: int
+    skip_plan_review: bool
+    gh_review: bool
+    merge: bool
+    codex_model: str | None
+    codex_effort: str | None
+    claude_model: str | None
+    claude_effort: str | None
+    log_path: str
+    phase: str = "initialized"
+    plan_review_round: int = 1
+    local_review_round: int = 1
+    gh_review_round: int = 1
+    pr_url: str = ""
+    approved: bool = False
+
+
+def state_path(repo: pathlib.Path, run_id: str) -> pathlib.Path:
+    return repo / ".a2a" / "runs" / run_id / "state.json"
+
+
+def resolve_state_path(repo: pathlib.Path, value: str) -> pathlib.Path:
+    candidate = pathlib.Path(value).expanduser()
+    if candidate.is_dir():
+        return candidate / "state.json"
+    if candidate.suffix == ".json" or "/" in value:
+        if not candidate.is_absolute():
+            candidate = repo / candidate
+        return candidate
+    return state_path(repo, value)
+
+
+def save_state(repo: pathlib.Path, state: RunState, dry_run: bool, trace: WorkflowTrace) -> None:
+    if dry_run:
+        return
+    path = state_path(repo, state.run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(asdict(state), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    trace.event(f"checkpoint saved: {repo_relative(repo, path)}")
+
+
+def load_state(path: pathlib.Path) -> RunState:
+    if not path.exists():
+        raise SystemExit(f"Resume state does not exist: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("version") != STATE_VERSION:
+        raise SystemExit(f"Unsupported resume state version in {path}: {data.get('version')}")
+    return RunState(**data)
 
 
 def run(args: list[str], cwd: pathlib.Path, dry_run: bool, log_file: pathlib.Path) -> CmdResult:
@@ -250,6 +316,11 @@ def ensure_branch(repo: pathlib.Path, branch: str, dry_run: bool, log: pathlib.P
     require_ok(result, "branch setup")
 
 
+def checkout_branch(repo: pathlib.Path, branch: str, dry_run: bool, log: pathlib.Path) -> None:
+    result = run(["git", "checkout", branch], cwd=repo, dry_run=dry_run, log_file=log)
+    require_ok(result, "branch checkout")
+
+
 def slugify_goal(goal: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", goal.lower()).strip("-")
     return slug[:64].strip("-") or "a2a-plan"
@@ -264,6 +335,7 @@ def ensure_a2a_dirs(repo: pathlib.Path, dry_run: bool) -> None:
         return
     (repo / ".a2a" / "plans").mkdir(parents=True, exist_ok=True)
     (repo / ".a2a" / "reviews").mkdir(parents=True, exist_ok=True)
+    (repo / ".a2a" / "runs").mkdir(parents=True, exist_ok=True)
 
 
 def read_if_present(path: pathlib.Path, fallback: str = "") -> str:
@@ -543,200 +615,205 @@ Instructions:
 
 def negotiate_plan(
     repo: pathlib.Path,
-    goal: str,
-    base: str,
     plan_path: pathlib.Path,
-    planner: str,
-    implementer: str,
-    reviewer: str,
-    max_plan_rounds: int,
-    skip_plan_review: bool,
     dry_run: bool,
     log: pathlib.Path,
     trace: WorkflowTrace,
-    codex_model: str | None,
-    codex_effort: str | None,
-    claude_model: str | None,
-    claude_effort: str | None,
+    state: RunState,
     create_plan: bool,
 ) -> str:
     plan_rel = repo_relative(repo, plan_path)
-    if create_plan:
-        trace.event(f"planning starts: {planner} writes {plan_rel}")
-        run_agent(
-            planner,
-            "write implementation plan",
-            build_plan_prompt(goal, base, plan_rel),
-            repo,
-            dry_run,
-            log,
-            trace,
-            codex_model,
-            codex_effort,
-            claude_model,
-            claude_effort,
-            artifact=plan_rel,
-        )
+    if state.phase == "initialized":
+        if create_plan:
+            trace.event(f"planning starts: {state.planner} writes {plan_rel}")
+            run_agent(
+                state.planner,
+                "write implementation plan",
+                build_plan_prompt(state.goal, state.base, plan_rel),
+                repo,
+                dry_run,
+                log,
+                trace,
+                state.codex_model,
+                state.codex_effort,
+                state.claude_model,
+                state.claude_effort,
+                artifact=plan_rel,
+            )
+        else:
+            trace.event(f"using existing plan: {plan_rel}")
+        state.phase = "plan_written"
+        save_state(repo, state, dry_run, trace)
+    elif state.phase == "plan_written":
+        trace.event(f"resuming plan review from: {plan_rel}")
     else:
-        trace.event(f"using existing plan: {plan_rel}")
+        trace.event(f"plan already ready: {plan_rel}")
 
-    if skip_plan_review:
-        trace.event("plan review skipped")
+    if state.phase != "plan_written":
         return read_if_present(plan_path, "DRY_RUN_PLAN")
 
-    for round_index in range(1, max_plan_rounds + 1):
-        trace.event(f"plan review round {round_index}/{max_plan_rounds}")
+    if state.skip_plan_review:
+        trace.event("plan review skipped")
+        state.phase = "plan_ready"
+        save_state(repo, state, dry_run, trace)
+        return read_if_present(plan_path, "DRY_RUN_PLAN")
+
+    for round_index in range(state.plan_review_round, state.max_plan_rounds + 1):
+        trace.event(f"plan review round {round_index}/{state.max_plan_rounds}")
         run_agent(
-            implementer,
+            state.implementer,
             "review and enhance plan",
-            build_plan_review_prompt(goal, base, plan_rel),
+            build_plan_review_prompt(state.goal, state.base, plan_rel),
             repo,
             dry_run,
             log,
             trace,
-            codex_model,
-            codex_effort,
-            claude_model,
-            claude_effort,
+            state.codex_model,
+            state.codex_effort,
+            state.claude_model,
+            state.claude_effort,
             artifact=plan_rel,
         )
         approval = run_agent(
-            reviewer,
+            state.reviewer,
             "approve plan",
-            build_plan_approval_prompt(goal, base, plan_rel),
+            build_plan_approval_prompt(state.goal, state.base, plan_rel),
             repo,
             dry_run,
             log,
             trace,
-            codex_model,
-            codex_effort,
-            claude_model,
-            claude_effort,
+            state.codex_model,
+            state.codex_effort,
+            state.claude_model,
+            state.claude_effort,
             artifact=plan_rel,
         )
         if dry_run:
             approval = PLAN_APPROVAL_TOKEN
         if PLAN_APPROVAL_TOKEN in approval:
+            state.phase = "plan_ready"
+            save_state(repo, state, dry_run, trace)
             return read_if_present(plan_path, "DRY_RUN_PLAN")
+        state.plan_review_round = round_index + 1
+        save_state(repo, state, dry_run, trace)
 
-    raise SystemExit(f"Plan was not approved within {max_plan_rounds} rounds. See {log}")
+    raise SystemExit(
+        f"Plan was not approved within {state.max_plan_rounds} rounds. "
+        f"Resume with more rounds: a2a-loop --resume {state.run_id} --max-plan-rounds 2"
+    )
 
 
 def run_local_review_loop(
     repo: pathlib.Path,
-    goal: str,
-    base: str,
     plan_path: pathlib.Path,
-    reviewer: str,
-    implementer: str,
-    max_rounds: int,
     dry_run: bool,
     log: pathlib.Path,
     trace: WorkflowTrace,
-    codex_model: str | None,
-    codex_effort: str | None,
-    claude_model: str | None,
-    claude_effort: str | None,
+    state: RunState,
 ) -> bool:
     plan_rel = repo_relative(repo, plan_path)
-    for round_index in range(1, max_rounds + 1):
+    for round_index in range(state.local_review_round, state.max_rounds + 1):
         review_path = repo / ".a2a" / "reviews" / f"review-{round_index}.md"
         review_rel = repo_relative(repo, review_path)
-        trace.event(f"local review round {round_index}/{max_rounds}: {review_rel}")
+        trace.event(f"local review round {round_index}/{state.max_rounds}: {review_rel}")
         review = run_agent(
-            reviewer,
+            state.reviewer,
             "review local diff",
-            build_local_review_prompt(goal, base, plan_rel, review_rel),
+            build_local_review_prompt(state.goal, state.base, plan_rel, review_rel),
             repo,
             dry_run,
             log,
             trace,
-            codex_model,
-            codex_effort,
-            claude_model,
-            claude_effort,
+            state.codex_model,
+            state.codex_effort,
+            state.claude_model,
+            state.claude_effort,
             artifact=review_rel,
         )
         if dry_run:
             review = APPROVAL_TOKEN
         if APPROVAL_TOKEN in review:
-            trace.event(f"review approved by {reviewer}")
+            trace.event(f"review approved by {state.reviewer}")
+            state.phase = "approved"
+            state.approved = True
+            save_state(repo, state, dry_run, trace)
             return True
 
         run_agent(
-            implementer,
+            state.implementer,
             "fix local review comments",
-            build_local_fix_prompt(goal, base, plan_rel, review_rel),
+            build_local_fix_prompt(state.goal, state.base, plan_rel, review_rel),
             repo,
             dry_run,
             log,
             trace,
-            codex_model,
-            codex_effort,
-            claude_model,
-            claude_effort,
+            state.codex_model,
+            state.codex_effort,
+            state.claude_model,
+            state.claude_effort,
             artifact=review_rel,
         )
+        state.phase = "implementation_ready"
+        state.local_review_round = round_index + 1
+        save_state(repo, state, dry_run, trace)
 
     return False
 
 
 def run_gh_review_loop(
     repo: pathlib.Path,
-    goal: str,
-    pr_url: str,
-    reviewer: str,
-    implementer: str,
-    max_rounds: int,
     dry_run: bool,
     log: pathlib.Path,
     trace: WorkflowTrace,
-    codex_model: str | None,
-    codex_effort: str | None,
-    claude_model: str | None,
-    claude_effort: str | None,
+    state: RunState,
 ) -> bool:
-    for round_index in range(1, max_rounds + 1):
-        trace.event(f"GitHub review round {round_index}/{max_rounds}: {pr_url}")
+    for round_index in range(state.gh_review_round, state.max_rounds + 1):
+        trace.event(f"GitHub review round {round_index}/{state.max_rounds}: {state.pr_url}")
         review = run_agent(
-            reviewer,
+            state.reviewer,
             "review GitHub PR",
-            build_gh_review_prompt(goal, pr_url),
+            build_gh_review_prompt(state.goal, state.pr_url),
             repo,
             dry_run,
             log,
             trace,
-            codex_model,
-            codex_effort,
-            claude_model,
-            claude_effort,
-            artifact=pr_url,
+            state.codex_model,
+            state.codex_effort,
+            state.claude_model,
+            state.claude_effort,
+            artifact=state.pr_url,
         )
         if dry_run:
             review = APPROVAL_TOKEN
         if APPROVAL_TOKEN in review:
-            trace.event(f"GitHub review approved by {reviewer}")
+            trace.event(f"GitHub review approved by {state.reviewer}")
+            state.phase = "approved"
+            state.approved = True
+            save_state(repo, state, dry_run, trace)
             return True
         run_agent(
-            implementer,
+            state.implementer,
             "fix GitHub review comments",
-            build_gh_fix_prompt(goal, pr_url, review),
+            build_gh_fix_prompt(state.goal, state.pr_url, review),
             repo,
             dry_run,
             log,
             trace,
-            codex_model,
-            codex_effort,
-            claude_model,
-            claude_effort,
-            artifact=pr_url,
+            state.codex_model,
+            state.codex_effort,
+            state.claude_model,
+            state.claude_effort,
+            artifact=state.pr_url,
         )
         gh_text(
             repo,
-            ["pr", "comment", pr_url, "--body", f"Implementer pushed fixes for round {round_index}."],
+            ["pr", "comment", state.pr_url, "--body", f"Implementer pushed fixes for round {round_index}."],
             dry_run,
             log,
         )
+        state.phase = "pr_ready"
+        state.gh_review_round = round_index + 1
+        save_state(repo, state, dry_run, trace)
 
     return False
 
@@ -763,6 +840,7 @@ def main() -> int:
     )
     parser.add_argument("--goal", help="Goal to plan and implement. Optional when --plan is passed.")
     parser.add_argument("--plan", type=pathlib.Path, help="Use an existing .plan.md file instead of creating one.")
+    parser.add_argument("--resume", help="Resume a checkpoint from .a2a/runs/<id>/state.json, or pass a state path.")
     parser.add_argument("--base", default="main", help="Base branch for diff review and PR creation.")
     parser.add_argument("--branch", help="Branch to create/use. Defaults to a timestamped a2a/* branch.")
     parser.add_argument("--max-plan-rounds", type=int, default=2, help="Maximum plan negotiation rounds.")
@@ -798,120 +876,171 @@ def main() -> int:
     args = parser.parse_args()
     args.codex_effort = normalize_codex_effort(args.codex_effort)
 
-    repo = args.repo.expanduser().resolve()
-    if not repo.exists():
-        raise SystemExit(f"Repo does not exist: {repo}")
-    if not args.goal and not args.plan:
-        raise SystemExit("Either --goal or --plan is required.")
+    initial_repo = args.repo.expanduser().resolve()
+    if not initial_repo.exists():
+        raise SystemExit(f"Repo does not exist: {initial_repo}")
 
-    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
-    branch = args.branch or f"a2a/{stamp}"
-    log_dir = pathlib.Path.cwd() / "a2a-logs" / stamp
-    log = log_dir / "run.log"
-    trace = WorkflowTrace(log)
-    goal = args.goal
-    if args.plan:
-        plan_path = resolve_repo_path(repo, args.plan)
-        if not plan_path.exists():
-            raise SystemExit(f"Plan does not exist: {plan_path}")
-        goal = goal or f"Execute plan {repo_relative(repo, plan_path)}"
+    if args.resume:
+        loaded_path = resolve_state_path(initial_repo, args.resume).resolve()
+        state = load_state(loaded_path)
+        repo = pathlib.Path(state.repo).expanduser().resolve()
+        if not repo.exists():
+            raise SystemExit(f"Repo from resume state does not exist: {repo}")
+        log = pathlib.Path(state.log_path).expanduser()
+        trace = WorkflowTrace(log)
+        extra_plan_rounds = args.max_plan_rounds
+        extra_review_rounds = args.max_rounds
+        state.max_plan_rounds = max(
+            state.max_plan_rounds,
+            state.plan_review_round + extra_plan_rounds - 1,
+        )
+        state.max_rounds = max(
+            state.max_rounds,
+            state.local_review_round + extra_review_rounds - 1,
+            state.gh_review_round + extra_review_rounds - 1,
+        )
+        if args.merge:
+            state.merge = True
+        plan_path = resolve_repo_path(repo, pathlib.Path(state.plan_path))
+        create_plan = False
+        trace.event(f"resuming run {state.run_id} from {repo_relative(repo, loaded_path)}")
     else:
-        assert goal is not None
-        plan_path = repo / ".a2a" / "plans" / f"{slugify_goal(goal)}.plan.md"
+        repo = initial_repo
+        if not args.goal and not args.plan:
+            raise SystemExit("Either --goal, --plan, or --resume is required.")
+
+        stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
+        branch = args.branch or f"a2a/{stamp}"
+        log_dir = pathlib.Path.cwd() / "a2a-logs" / stamp
+        log = log_dir / "run.log"
+        trace = WorkflowTrace(log)
+        goal = args.goal
+        if args.plan:
+            plan_path = resolve_repo_path(repo, args.plan)
+            if not plan_path.exists():
+                raise SystemExit(f"Plan does not exist: {plan_path}")
+            goal = goal or f"Execute plan {repo_relative(repo, plan_path)}"
+            create_plan = False
+        else:
+            assert goal is not None
+            plan_path = repo / ".a2a" / "plans" / f"{slugify_goal(goal)}.plan.md"
+            create_plan = True
+        state = RunState(
+            version=STATE_VERSION,
+            run_id=stamp,
+            repo=str(repo),
+            branch=branch,
+            base=args.base,
+            goal=goal,
+            plan_path=repo_relative(repo, plan_path),
+            planner=args.planner,
+            implementer=args.implementer,
+            reviewer=args.reviewer,
+            max_plan_rounds=args.max_plan_rounds,
+            max_rounds=args.max_rounds,
+            skip_plan_review=args.skip_plan_review,
+            gh_review=args.gh_review,
+            merge=args.merge,
+            codex_model=args.codex_model,
+            codex_effort=args.codex_effort,
+            claude_model=args.claude_model,
+            claude_effort=args.claude_effort,
+            log_path=str(log),
+        )
 
     ensure_a2a_dirs(repo, args.dry_run)
     trace.event(f"repo: {repo}")
-    trace.event(f"branch setup: {branch}")
-    ensure_branch(repo, branch, args.dry_run, log)
+    if args.resume:
+        trace.event(f"branch checkout: {state.branch}")
+        checkout_branch(repo, state.branch, args.dry_run, log)
+    else:
+        trace.event(f"branch setup: {state.branch}")
+        ensure_branch(repo, state.branch, args.dry_run, log)
+        save_state(repo, state, args.dry_run, trace)
 
     plan = negotiate_plan(
         repo,
-        goal,
-        args.base,
         plan_path,
-        args.planner,
-        args.implementer,
-        args.reviewer,
-        args.max_plan_rounds,
-        args.skip_plan_review,
         args.dry_run,
         log,
         trace,
-        args.codex_model,
-        args.codex_effort,
-        args.claude_model,
-        args.claude_effort,
-        create_plan=args.plan is None,
+        state,
+        create_plan=create_plan,
     )
 
-    run_agent(
-        args.implementer,
-        "implement approved plan",
-        build_implement_prompt(goal, repo_relative(repo, plan_path), args.base),
-        repo,
-        args.dry_run,
-        log,
-        trace,
-        args.codex_model,
-        args.codex_effort,
-        args.claude_model,
-        args.claude_effort,
-        artifact=repo_relative(repo, plan_path),
-    )
-
-    pr_url = ""
-    if args.gh_review:
-        trace.event(f"opening or updating PR before GitHub review: base {args.base}, branch {branch}")
-        pr_url = open_or_update_pr(repo, args.base, branch, goal, plan, args.dry_run, log)
-        approved = run_gh_review_loop(
+    if state.phase == "plan_ready":
+        run_agent(
+            state.implementer,
+            "implement approved plan",
+            build_implement_prompt(state.goal, repo_relative(repo, plan_path), state.base),
             repo,
-            goal,
-            pr_url,
-            args.reviewer,
-            args.implementer,
-            args.max_rounds,
             args.dry_run,
             log,
             trace,
-            args.codex_model,
-            args.codex_effort,
-            args.claude_model,
-            args.claude_effort,
+            state.codex_model,
+            state.codex_effort,
+            state.claude_model,
+            state.claude_effort,
+            artifact=repo_relative(repo, plan_path),
+        )
+        state.phase = "implementation_ready"
+        save_state(repo, state, args.dry_run, trace)
+    elif state.phase == "implementation_ready":
+        trace.event("implementation already ready; resuming review")
+    elif state.phase in ("approved", "pr_ready", "done"):
+        trace.event(f"implementation/review already reached phase: {state.phase}")
+    else:
+        raise SystemExit(f"Cannot continue from phase {state.phase}")
+
+    if state.phase == "done":
+        trace.event(f"run already complete. PR: {state.pr_url}")
+        trace.event(f"logs: {log}")
+        return 0
+
+    if state.gh_review:
+        if not state.pr_url:
+            trace.event(f"opening or updating PR before GitHub review: base {state.base}, branch {state.branch}")
+            state.pr_url = open_or_update_pr(repo, state.base, state.branch, state.goal, plan, args.dry_run, log)
+            state.phase = "pr_ready"
+            save_state(repo, state, args.dry_run, trace)
+        approved = state.phase == "approved" or run_gh_review_loop(
+            repo,
+            args.dry_run,
+            log,
+            trace,
+            state,
         )
     else:
-        approved = run_local_review_loop(
+        approved = state.phase == "approved" or run_local_review_loop(
             repo,
-            goal,
-            args.base,
             plan_path,
-            args.reviewer,
-            args.implementer,
-            args.max_rounds,
             args.dry_run,
             log,
             trace,
-            args.codex_model,
-            args.codex_effort,
-            args.claude_model,
-            args.claude_effort,
+            state,
         )
         if approved:
-            trace.event(f"opening or updating PR after local approval: base {args.base}, branch {branch}")
-            pr_url = open_or_update_pr(repo, args.base, branch, goal, plan, args.dry_run, log)
+            if not state.pr_url:
+                trace.event(f"opening or updating PR after local approval: base {state.base}, branch {state.branch}")
+                state.pr_url = open_or_update_pr(repo, state.base, state.branch, state.goal, plan, args.dry_run, log)
+                save_state(repo, state, args.dry_run, trace)
 
     if not approved:
-        pr_note = f" PR: {pr_url}" if pr_url else ""
-        trace.event(f"not approved within {args.max_rounds} review rounds.{pr_note}")
+        pr_note = f" PR: {state.pr_url}" if state.pr_url else ""
+        trace.event(f"not approved within {state.max_rounds} review rounds.{pr_note}")
+        trace.event(f"resume with: a2a-loop --resume {state.run_id}")
         trace.event(f"logs: {log}")
         return 2
 
-    trace.event(f"approved by {args.reviewer}. PR: {pr_url}")
-    if args.merge:
-        trace.event(f"merge requested: squash {pr_url}")
-        gh_text(repo, ["pr", "merge", pr_url, "--squash", "--delete-branch"], args.dry_run, log)
+    trace.event(f"approved by {state.reviewer}. PR: {state.pr_url}")
+    if state.merge:
+        trace.event(f"merge requested: squash {state.pr_url}")
+        gh_text(repo, ["pr", "merge", state.pr_url, "--squash", "--delete-branch"], args.dry_run, log)
         trace.event("squash merge requested")
     else:
         trace.event("merge skipped; pass --merge to squash merge automatically")
+    state.phase = "done"
+    save_state(repo, state, args.dry_run, trace)
     trace.event(f"logs: {log}")
     return 0
 

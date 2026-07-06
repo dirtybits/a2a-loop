@@ -230,6 +230,26 @@ Add `--gh-review` when you want Claude and Codex to coordinate through GitHub
 PR comments instead of local review files.
 Add `--plan path/to/file.plan.md` when you already have a plan to execute.
 
+## Resume
+
+Real runs checkpoint after each completed phase to:
+
+```text
+.a2a/runs/<run-id>/state.json
+```
+
+If a run exits early, resume it from the same target repo:
+
+```bash
+a2a-loop --resume <run-id>
+```
+
+You can also pass the state file path directly. On resume, the coordinator
+checks out the saved branch, appends to the original log, reuses the saved plan
+and role settings, and continues from the next incomplete phase. If the earlier
+run stopped after exhausting review rounds, `--max-rounds` on resume adds
+another bounded batch of rounds instead of restarting at `review-1.md`.
+
 ## Safety
 
 - Run on a clean branch or disposable worktree.
