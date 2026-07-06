@@ -90,10 +90,14 @@ with `--codex-model`, `--codex-effort`, `--claude-model`, and
 - Watch the terminal for agent step, handoff, approval, PR, and merge status.
 - Inspect `a2a-logs/<timestamp>/run.log`, `.a2a/plans/`, and `.a2a/reviews/`
   when debugging a run.
+- Local review stdout is persisted to `.a2a/reviews/review-N.md` if the
+  reviewer could not write the file directly.
 - Real runs checkpoint to `.a2a/runs/<run-id>/state.json`; use
   `a2a-loop --resume <run-id>` to continue from the next incomplete phase.
 - On resume, `--max-plan-rounds` and `--max-rounds` add another bounded batch
   from the saved next round.
+- Fatal agent output, such as unsupported-model API errors, should halt the
+  loop immediately with captured stdout/stderr visible to the operator.
 
 ## Tool Location
 

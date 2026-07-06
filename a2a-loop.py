@@ -35,6 +35,11 @@ CODEX_EFFORT_ALIASES = {
     "max": "high",
 }
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+AGENT_FATAL_PATTERNS = (
+    "ERROR: unexpected status",
+    "unexpected status 400 Bad Request",
+    "requires a newer version of Codex",
+)
 
 
 def env_default(name: str) -> str | None:
@@ -196,7 +201,26 @@ def run(args: list[str], cwd: pathlib.Path, dry_run: bool, log_file: pathlib.Pat
 def require_ok(result: CmdResult, context: str) -> None:
     if result.returncode != 0:
         rendered = " ".join(shlex.quote(a) for a in result.args)
-        raise SystemExit(f"{context} failed ({result.returncode}): {rendered}\n{result.stderr}")
+        raise SystemExit(format_command_failure(context, result, f"exit code {result.returncode}"))
+
+
+def format_command_failure(context: str, result: CmdResult, reason: str) -> str:
+    rendered = " ".join(shlex.quote(a) for a in result.args)
+    parts = [
+        f"{context} failed ({reason}): {rendered}",
+    ]
+    if result.stdout.strip():
+        parts.extend(["", "[stdout]", result.stdout.strip()])
+    if result.stderr.strip():
+        parts.extend(["", "[stderr]", result.stderr.strip()])
+    return "\n".join(parts)
+
+
+def require_no_agent_error(result: CmdResult, context: str) -> None:
+    combined = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    for pattern in AGENT_FATAL_PATTERNS:
+        if pattern in combined:
+            raise SystemExit(format_command_failure(context, result, f"fatal agent output: {pattern}"))
 
 
 def claude_print(
@@ -228,6 +252,7 @@ def claude_print(
         log_file=log,
     )
     require_ok(result, "Claude turn")
+    require_no_agent_error(result, "Claude turn")
     return result.stdout
 
 
@@ -262,6 +287,7 @@ def codex_exec(
         log_file=log,
     )
     require_ok(result, "Codex turn")
+    require_no_agent_error(result, "Codex turn")
     return result.stdout
 
 
@@ -342,6 +368,21 @@ def read_if_present(path: pathlib.Path, fallback: str = "") -> str:
     if not path.exists():
         return fallback
     return path.read_text(encoding="utf-8")
+
+
+def persist_review_output(path: pathlib.Path, output: str, dry_run: bool, trace: WorkflowTrace) -> None:
+    if not output.strip():
+        trace.event(f"review output empty; no fallback write for {path.name}")
+        return
+    if path.exists() and path.read_text(encoding="utf-8").strip():
+        trace.event(f"review file already written: {path.name}")
+        return
+    if dry_run:
+        trace.event(f"dry-run would persist reviewer stdout: {path.name}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(output.rstrip() + "\n", encoding="utf-8")
+    trace.event(f"persisted reviewer stdout: {path.name}")
 
 
 def resolve_repo_path(repo: pathlib.Path, value: pathlib.Path) -> pathlib.Path:
@@ -730,6 +771,7 @@ def run_local_review_loop(
             state.claude_effort,
             artifact=review_rel,
         )
+        persist_review_output(review_path, review, dry_run, trace)
         if dry_run:
             review = APPROVAL_TOKEN
         if APPROVAL_TOKEN in review:

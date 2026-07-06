@@ -262,6 +262,10 @@ another bounded batch of rounds instead of restarting at `review-1.md`.
 - The terminal shows each agent step, handoff, approval, PR, and merge action.
 - Logs are written to `a2a-logs/<timestamp>/run.log` with the same status
   breadcrumbs plus raw commands and agent output.
+- Local review stdout is persisted to `.a2a/reviews/review-N.md` if the reviewer
+  could not write the file directly.
+- Fatal agent output, such as unsupported-model API errors, stops the loop
+  immediately and prints the captured stdout/stderr for the operator.
 
 ## License
 
