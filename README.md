@@ -147,7 +147,7 @@ configured default. Override models and effort per run:
 a2a-loop \
   --goal "Implement the feature..." \
   --codex-model gpt-5.5 \
-  --codex-effort extra-high \
+  --codex-effort high \
   --claude-model claude-fable-5 \
   --dry-run
 ```
@@ -156,7 +156,7 @@ Or set environment variables:
 
 ```bash
 export A2A_CODEX_MODEL=gpt-5.5
-export A2A_CODEX_EFFORT=extra-high
+export A2A_CODEX_EFFORT=high
 export A2A_CLAUDE_MODEL=claude-fable-5
 ```
 
@@ -164,10 +164,15 @@ Available model-related flags:
 
 ```text
 --codex-model gpt-5.5
---codex-effort extra-high
+--codex-effort high
 --claude-model claude-fable-5
 --claude-effort high
 ```
+
+Codex effort is left to the Codex CLI default unless `--codex-effort` or
+`A2A_CODEX_EFFORT` is set. Supported Codex effort values are `minimal`, `low`,
+`medium`, and `high`. For compatibility, `extra-high`, `xhigh`, and `max` map
+to Codex `high`.
 
 Claude effort is left to the Claude CLI default unless `--claude-effort` or
 `A2A_CLAUDE_EFFORT` is set. Supported Claude effort values are `low`, `medium`,

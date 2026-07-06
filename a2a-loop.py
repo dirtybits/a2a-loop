@@ -27,6 +27,12 @@ PLAN_APPROVAL_TOKEN = "PLAN_STATUS: approved"
 PLAN_CHANGES_TOKEN = "PLAN_STATUS: changes_requested"
 REVIEW_CHANGES_TOKEN = "REVIEW_STATUS: changes_requested"
 AGENTS = ("claude", "codex")
+CODEX_EFFORTS = ("minimal", "low", "medium", "high")
+CODEX_EFFORT_ALIASES = {
+    "extra-high": "high",
+    "xhigh": "high",
+    "max": "high",
+}
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
@@ -35,6 +41,20 @@ def env_default(name: str) -> str | None:
     if value is None or not value.strip():
         return None
     return value
+
+
+def normalize_codex_effort(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = CODEX_EFFORT_ALIASES.get(value, value)
+    if normalized not in CODEX_EFFORTS:
+        accepted = [*CODEX_EFFORTS, *CODEX_EFFORT_ALIASES]
+        raise SystemExit(
+            "Codex effort must be one of: "
+            + ", ".join(accepted)
+            + ". Note: xhigh/max are Claude effort names and map to Codex high."
+        )
+    return normalized
 
 
 @dataclass
@@ -708,6 +728,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--merge", action="store_true", help="Squash merge after reviewer approval.")
     args = parser.parse_args()
+    args.codex_effort = normalize_codex_effort(args.codex_effort)
 
     repo = args.repo.expanduser().resolve()
     if not repo.exists():

@@ -75,8 +75,10 @@ Keep the default split unless the user asks otherwise:
 Supported role values are `claude` and `codex`. By default, `a2a-loop` lets the
 Codex and Claude CLIs use their configured model defaults. Override per run
 with `--codex-model`, `--codex-effort`, `--claude-model`, and
-`--claude-effort low|medium|high|xhigh|max`, or use `A2A_CODEX_MODEL`,
-`A2A_CODEX_EFFORT`, `A2A_CLAUDE_MODEL`, and `A2A_CLAUDE_EFFORT`.
+`--claude-effort`, or use `A2A_CODEX_MODEL`, `A2A_CODEX_EFFORT`,
+`A2A_CLAUDE_MODEL`, and `A2A_CLAUDE_EFFORT`. Codex effort supports
+`minimal|low|medium|high`; compatibility aliases `extra-high`, `xhigh`, and
+`max` map to `high`. Claude effort supports `low|medium|high|xhigh|max`.
 
 ## Safety Defaults
 
