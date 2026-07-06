@@ -35,6 +35,13 @@ CODEX_EFFORT_ALIASES = {
     "max": "high",
 }
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+CLAUDE_API_AUTH_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+)
 AGENT_FATAL_PATTERNS = (
     "ERROR: unexpected status",
     "unexpected status 400 Bad Request",
@@ -47,6 +54,11 @@ def env_default(name: str) -> str | None:
     if value is None or not value.strip():
         return None
     return value
+
+
+def env_flag(name: str) -> bool:
+    value = os.environ.get(name)
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def normalize_codex_effort(value: str | None) -> str | None:
@@ -82,20 +94,27 @@ class WorkflowTrace:
         print(line)
         self._write(line)
 
-    def start_agent(self, agent: str, phase: str, artifact: str | None = None) -> int:
+    def start_agent(
+        self,
+        agent: str,
+        phase: str,
+        model: str,
+        effort: str,
+        artifact: str | None = None,
+    ) -> int:
         if self.active_agent and self.active_agent != agent:
             self.event(f"handoff: {self.active_agent} -> {agent}")
         self.active_agent = agent
         self.step += 1
         suffix = f" ({artifact})" if artifact else ""
-        line = f"[agent:{agent}] step {self.step} start: {phase}{suffix}"
+        line = f"[agent:{agent}:{model}:{effort}] step {self.step} start: {phase}{suffix}"
         print(line)
         self._write(line)
         return self.step
 
-    def finish_agent(self, agent: str, step: int, phase: str, output: str) -> None:
+    def finish_agent(self, agent: str, step: int, phase: str, model: str, effort: str, output: str) -> None:
         detail = f", output {len(output)} chars" if output else ""
-        line = f"[agent:{agent}] step {step} done: {phase}{detail}"
+        line = f"[agent:{agent}:{model}:{effort}] step {step} done: {phase}{detail}"
         print(line)
         self._write(line)
 
@@ -127,6 +146,7 @@ class RunState:
     claude_model: str | None
     claude_effort: str | None
     log_path: str
+    claude_use_api_key: bool = False
     phase: str = "initialized"
     plan_review_round: int = 1
     local_review_round: int = 1
@@ -170,7 +190,13 @@ def load_state(path: pathlib.Path) -> RunState:
     return RunState(**data)
 
 
-def run(args: list[str], cwd: pathlib.Path, dry_run: bool, log_file: pathlib.Path) -> CmdResult:
+def run(
+    args: list[str],
+    cwd: pathlib.Path,
+    dry_run: bool,
+    log_file: pathlib.Path,
+    env: dict[str, str] | None = None,
+) -> CmdResult:
     rendered = " ".join(shlex.quote(a) for a in args)
     log_file.parent.mkdir(parents=True, exist_ok=True)
     with log_file.open("a", encoding="utf-8") as f:
@@ -188,6 +214,7 @@ def run(args: list[str], cwd: pathlib.Path, dry_run: bool, log_file: pathlib.Pat
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
     with log_file.open("a", encoding="utf-8") as f:
         if proc.stdout:
@@ -223,6 +250,15 @@ def require_no_agent_error(result: CmdResult, context: str) -> None:
             raise SystemExit(format_command_failure(context, result, f"fatal agent output: {pattern}"))
 
 
+def claude_env(use_api_key: bool) -> dict[str, str] | None:
+    if use_api_key:
+        return None
+    env = os.environ.copy()
+    for name in CLAUDE_API_AUTH_ENV_VARS:
+        env.pop(name, None)
+    return env
+
+
 def claude_print(
     prompt: str,
     repo: pathlib.Path,
@@ -230,6 +266,7 @@ def claude_print(
     log: pathlib.Path,
     model: str | None,
     effort: str | None,
+    use_api_key: bool,
 ) -> str:
     args = [
         "claude",
@@ -250,6 +287,7 @@ def claude_print(
         cwd=repo,
         dry_run=dry_run,
         log_file=log,
+        env=claude_env(use_api_key),
     )
     require_ok(result, "Claude turn")
     require_no_agent_error(result, "Claude turn")
@@ -303,16 +341,22 @@ def run_agent(
     codex_effort: str | None,
     claude_model: str | None,
     claude_effort: str | None,
+    claude_use_api_key: bool,
     artifact: str | None = None,
 ) -> str:
-    step = trace.start_agent(agent, phase, artifact)
     if agent == "claude":
-        output = claude_print(prompt, repo, dry_run, log, claude_model, claude_effort)
-        trace.finish_agent(agent, step, phase, output)
+        model = claude_model or "default"
+        effort = claude_effort or "default"
+        step = trace.start_agent(agent, phase, model, effort, artifact)
+        output = claude_print(prompt, repo, dry_run, log, claude_model, claude_effort, claude_use_api_key)
+        trace.finish_agent(agent, step, phase, model, effort, output)
         return output
     if agent == "codex":
+        model = codex_model or "default"
+        effort = codex_effort or "default"
+        step = trace.start_agent(agent, phase, model, effort, artifact)
         output = codex_exec(prompt, repo, dry_run, log, codex_model, codex_effort)
-        trace.finish_agent(agent, step, phase, output)
+        trace.finish_agent(agent, step, phase, model, effort, output)
         return output
     raise ValueError(f"Unsupported agent: {agent}")
 
@@ -703,6 +747,7 @@ def negotiate_plan(
                 state.codex_effort,
                 state.claude_model,
                 state.claude_effort,
+                state.claude_use_api_key,
                 artifact=plan_rel,
             )
         else:
@@ -737,6 +782,7 @@ def negotiate_plan(
             state.codex_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_use_api_key,
             artifact=plan_rel,
         )
         approval = run_agent(
@@ -751,6 +797,7 @@ def negotiate_plan(
             state.codex_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_use_api_key,
             artifact=plan_rel,
         )
         if dry_run:
@@ -793,6 +840,7 @@ def run_local_review_loop(
             state.codex_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_use_api_key,
             artifact=review_rel,
         )
         persist_review_output(review_path, review, dry_run, trace)
@@ -817,6 +865,7 @@ def run_local_review_loop(
             state.codex_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_use_api_key,
             artifact=review_rel,
         )
         state.phase = "implementation_ready"
@@ -847,6 +896,7 @@ def run_gh_review_loop(
             state.codex_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_use_api_key,
             artifact=state.pr_url,
         )
         if dry_run:
@@ -869,6 +919,7 @@ def run_gh_review_loop(
             state.codex_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_use_api_key,
             artifact=state.pr_url,
         )
         gh_text(
@@ -889,6 +940,7 @@ def main() -> int:
     default_codex_effort = env_default("A2A_CODEX_EFFORT")
     default_claude_model = env_default("A2A_CLAUDE_MODEL")
     default_claude_effort = env_default("A2A_CLAUDE_EFFORT")
+    default_claude_use_api_key = env_flag("A2A_CLAUDE_USE_API_KEY")
     if default_claude_effort and default_claude_effort not in CLAUDE_EFFORTS:
         raise SystemExit(
             "A2A_CLAUDE_EFFORT must be one of: " + ", ".join(CLAUDE_EFFORTS)
@@ -939,6 +991,12 @@ def main() -> int:
     parser.add_argument("--gh-review", action="store_true", help="Use GitHub PR comments as the review surface.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--merge", action="store_true", help="Squash merge after reviewer approval.")
+    parser.add_argument(
+        "--claude-use-api-key",
+        action="store_true",
+        default=default_claude_use_api_key,
+        help="Let claude inherit ANTHROPIC_* API-key auth instead of using claude.ai login/subscription auth.",
+    )
     args = parser.parse_args()
     args.codex_effort = normalize_codex_effort(args.codex_effort)
 
@@ -1011,11 +1069,16 @@ def main() -> int:
             codex_effort=args.codex_effort,
             claude_model=args.claude_model,
             claude_effort=args.claude_effort,
+            claude_use_api_key=args.claude_use_api_key,
             log_path=str(log),
         )
 
     ensure_a2a_dirs(repo, args.dry_run)
     trace.event(f"repo: {repo}")
+    trace.event(
+        "Claude auth: "
+        + ("API key env inherited" if state.claude_use_api_key else "claude.ai login/subscription")
+    )
     ensure_gitignore(repo, args.dry_run, trace)
     if args.resume:
         trace.event(f"branch checkout: {state.branch}")
@@ -1048,6 +1111,7 @@ def main() -> int:
             state.codex_effort,
             state.claude_model,
             state.claude_effort,
+            state.claude_use_api_key,
             artifact=repo_relative(repo, plan_path),
         )
         state.phase = "implementation_ready"

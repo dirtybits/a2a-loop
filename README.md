@@ -178,6 +178,11 @@ Claude effort is left to the Claude CLI default unless `--claude-effort` or
 `A2A_CLAUDE_EFFORT` is set. Supported Claude effort values are `low`, `medium`,
 `high`, `xhigh`, and `max`.
 
+By default, `a2a-loop` runs Claude through the local `claude` login/subscription
+auth path by stripping API-key auth environment variables from Claude
+subprocesses. Pass `--claude-use-api-key` or set `A2A_CLAUDE_USE_API_KEY=1`
+when you intentionally want API-key billing.
+
 The script shells out to three CLIs:
 
 ```text

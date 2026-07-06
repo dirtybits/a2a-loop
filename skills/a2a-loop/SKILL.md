@@ -79,6 +79,9 @@ with `--codex-model`, `--codex-effort`, `--claude-model`, and
 `A2A_CLAUDE_MODEL`, and `A2A_CLAUDE_EFFORT`. Codex effort supports
 `minimal|low|medium|high`; compatibility aliases `extra-high`, `xhigh`, and
 `max` map to `high`. Claude effort supports `low|medium|high|xhigh|max`.
+Claude uses local claude.ai login/subscription auth by default; pass
+`--claude-use-api-key` or set `A2A_CLAUDE_USE_API_KEY=1` only when API-key
+billing is intentional.
 
 ## Safety Defaults
 
