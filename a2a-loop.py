@@ -362,6 +362,30 @@ def ensure_a2a_dirs(repo: pathlib.Path, dry_run: bool) -> None:
     (repo / ".a2a" / "plans").mkdir(parents=True, exist_ok=True)
     (repo / ".a2a" / "reviews").mkdir(parents=True, exist_ok=True)
     (repo / ".a2a" / "runs").mkdir(parents=True, exist_ok=True)
+    (repo / ".a2a" / "logs").mkdir(parents=True, exist_ok=True)
+
+
+def ensure_gitignore(repo: pathlib.Path, dry_run: bool, trace: WorkflowTrace | None = None) -> None:
+    patterns = (".a2a/", "a2a-logs/")
+    gitignore = repo / ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    normalized = {
+        line.strip().rstrip("/")
+        for line in existing.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    missing = [pattern for pattern in patterns if pattern.rstrip("/") not in normalized]
+    if not missing:
+        return
+    if dry_run:
+        if trace:
+            trace.event("dry-run would update .gitignore: " + ", ".join(missing))
+        return
+    prefix = "" if not existing or existing.endswith("\n") else "\n"
+    suffix = "".join(f"{pattern}\n" for pattern in missing)
+    gitignore.write_text(existing + prefix + suffix, encoding="utf-8")
+    if trace:
+        trace.event("updated .gitignore: " + ", ".join(missing))
 
 
 def read_if_present(path: pathlib.Path, fallback: str = "") -> str:
@@ -953,7 +977,7 @@ def main() -> int:
 
         stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
         branch = args.branch or f"a2a/{stamp}"
-        log_dir = pathlib.Path.cwd() / "a2a-logs" / stamp
+        log_dir = repo / ".a2a" / "logs" / stamp
         log = log_dir / "run.log"
         trace = WorkflowTrace(log)
         goal = args.goal
@@ -992,6 +1016,7 @@ def main() -> int:
 
     ensure_a2a_dirs(repo, args.dry_run)
     trace.event(f"repo: {repo}")
+    ensure_gitignore(repo, args.dry_run, trace)
     if args.resume:
         trace.event(f"branch checkout: {state.branch}")
         checkout_branch(repo, state.branch, args.dry_run, log)

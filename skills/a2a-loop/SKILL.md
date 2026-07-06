@@ -82,13 +82,13 @@ with `--codex-model`, `--codex-effort`, `--claude-model`, and
 
 ## Safety Defaults
 
-- Keep `.a2a/` as local working memory; it should normally be gitignored.
-- Keep `a2a-logs/` gitignored because it contains run logs.
+- Keep `.a2a/` as local working memory; the coordinator adds it to `.gitignore`.
+- Keep legacy `a2a-logs/` ignored for runs created by older coordinator versions.
 - Keep `--max-plan-rounds` and `--max-rounds` bounded.
 - Prefer a clean branch or disposable worktree for target projects.
 - Do not merge unless the exact `MERGE_DECISION: APPROVE` token appears.
 - Watch the terminal for agent step, handoff, approval, PR, and merge status.
-- Inspect `a2a-logs/<timestamp>/run.log`, `.a2a/plans/`, and `.a2a/reviews/`
+- Inspect `.a2a/logs/<timestamp>/run.log`, `.a2a/plans/`, and `.a2a/reviews/`
   when debugging a run.
 - Local review stdout is persisted to `.a2a/reviews/review-N.md` if the
   reviewer could not write the file directly.

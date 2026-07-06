@@ -254,13 +254,13 @@ another bounded batch of rounds instead of restarting at `review-1.md`.
 
 - Run on a clean branch or disposable worktree.
 - `.a2a/` is ignored by default because it is local working memory.
-- `a2a-logs/` is ignored by default because it contains run logs.
+- `.a2a/` and legacy `a2a-logs/` are added to `.gitignore` automatically.
 - Keep `--max-plan-rounds` bounded.
 - Keep `--max-rounds` bounded.
 - Do not pass `--merge` until the dry-run and prompt contract look right.
 - The coordinator fails closed unless Claude emits `MERGE_DECISION: APPROVE`.
 - The terminal shows each agent step, handoff, approval, PR, and merge action.
-- Logs are written to `a2a-logs/<timestamp>/run.log` with the same status
+- Logs are written to `.a2a/logs/<timestamp>/run.log` with the same status
   breadcrumbs plus raw commands and agent output.
 - Local review stdout is persisted to `.a2a/reviews/review-N.md` if the reviewer
   could not write the file directly.
