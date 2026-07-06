@@ -239,7 +239,9 @@ Add `--plan path/to/file.plan.md` when you already have a plan to execute.
 - Keep `--max-rounds` bounded.
 - Do not pass `--merge` until the dry-run and prompt contract look right.
 - The coordinator fails closed unless Claude emits `MERGE_DECISION: APPROVE`.
-- Logs are written to `a2a-logs/<timestamp>/run.log`.
+- The terminal shows each agent step, handoff, approval, PR, and merge action.
+- Logs are written to `a2a-logs/<timestamp>/run.log` with the same status
+  breadcrumbs plus raw commands and agent output.
 
 ## License
 

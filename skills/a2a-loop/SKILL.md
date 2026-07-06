@@ -87,7 +87,9 @@ with `--codex-model`, `--codex-effort`, `--claude-model`, and
 - Keep `--max-plan-rounds` and `--max-rounds` bounded.
 - Prefer a clean branch or disposable worktree for target projects.
 - Do not merge unless the exact `MERGE_DECISION: APPROVE` token appears.
-- Inspect `a2a-logs/<timestamp>/run.log`, `.a2a/plans/`, and `.a2a/reviews/` when debugging a run.
+- Watch the terminal for agent step, handoff, approval, PR, and merge status.
+- Inspect `a2a-logs/<timestamp>/run.log`, `.a2a/plans/`, and `.a2a/reviews/`
+  when debugging a run.
 
 ## Tool Location
 

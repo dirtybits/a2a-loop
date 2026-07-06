@@ -65,6 +65,40 @@ class CmdResult:
     stderr: str
 
 
+@dataclass
+class WorkflowTrace:
+    log: pathlib.Path
+    step: int = 0
+    active_agent: str | None = None
+
+    def event(self, message: str) -> None:
+        line = f"[loop] {message}"
+        print(line)
+        self._write(line)
+
+    def start_agent(self, agent: str, phase: str, artifact: str | None = None) -> int:
+        if self.active_agent and self.active_agent != agent:
+            self.event(f"handoff: {self.active_agent} -> {agent}")
+        self.active_agent = agent
+        self.step += 1
+        suffix = f" ({artifact})" if artifact else ""
+        line = f"[agent:{agent}] step {self.step} start: {phase}{suffix}"
+        print(line)
+        self._write(line)
+        return self.step
+
+    def finish_agent(self, agent: str, step: int, phase: str, output: str) -> None:
+        detail = f", output {len(output)} chars" if output else ""
+        line = f"[agent:{agent}] step {step} done: {phase}{detail}"
+        print(line)
+        self._write(line)
+
+    def _write(self, line: str) -> None:
+        self.log.parent.mkdir(parents=True, exist_ok=True)
+        with self.log.open("a", encoding="utf-8") as f:
+            f.write(f"{line}\n")
+
+
 def run(args: list[str], cwd: pathlib.Path, dry_run: bool, log_file: pathlib.Path) -> CmdResult:
     rendered = " ".join(shlex.quote(a) for a in args)
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -167,19 +201,27 @@ def codex_exec(
 
 def run_agent(
     agent: str,
+    phase: str,
     prompt: str,
     repo: pathlib.Path,
     dry_run: bool,
     log: pathlib.Path,
+    trace: WorkflowTrace,
     codex_model: str | None,
     codex_effort: str | None,
     claude_model: str | None,
     claude_effort: str | None,
+    artifact: str | None = None,
 ) -> str:
+    step = trace.start_agent(agent, phase, artifact)
     if agent == "claude":
-        return claude_print(prompt, repo, dry_run, log, claude_model, claude_effort)
+        output = claude_print(prompt, repo, dry_run, log, claude_model, claude_effort)
+        trace.finish_agent(agent, step, phase, output)
+        return output
     if agent == "codex":
-        return codex_exec(prompt, repo, dry_run, log, codex_model, codex_effort)
+        output = codex_exec(prompt, repo, dry_run, log, codex_model, codex_effort)
+        trace.finish_agent(agent, step, phase, output)
+        return output
     raise ValueError(f"Unsupported agent: {agent}")
 
 
@@ -511,6 +553,7 @@ def negotiate_plan(
     skip_plan_review: bool,
     dry_run: bool,
     log: pathlib.Path,
+    trace: WorkflowTrace,
     codex_model: str | None,
     codex_effort: str | None,
     claude_model: str | None,
@@ -519,48 +562,57 @@ def negotiate_plan(
 ) -> str:
     plan_rel = repo_relative(repo, plan_path)
     if create_plan:
-        print(f"[loop] writing plan with {planner}: {plan_rel}")
+        trace.event(f"planning starts: {planner} writes {plan_rel}")
         run_agent(
             planner,
+            "write implementation plan",
             build_plan_prompt(goal, base, plan_rel),
             repo,
             dry_run,
             log,
+            trace,
             codex_model,
             codex_effort,
             claude_model,
             claude_effort,
+            artifact=plan_rel,
         )
     else:
-        print(f"[loop] using existing plan: {plan_rel}")
+        trace.event(f"using existing plan: {plan_rel}")
 
     if skip_plan_review:
-        print("[loop] plan review skipped")
+        trace.event("plan review skipped")
         return read_if_present(plan_path, "DRY_RUN_PLAN")
 
     for round_index in range(1, max_plan_rounds + 1):
-        print(f"[loop] plan review round {round_index}/{max_plan_rounds}")
+        trace.event(f"plan review round {round_index}/{max_plan_rounds}")
         run_agent(
             implementer,
+            "review and enhance plan",
             build_plan_review_prompt(goal, base, plan_rel),
             repo,
             dry_run,
             log,
+            trace,
             codex_model,
             codex_effort,
             claude_model,
             claude_effort,
+            artifact=plan_rel,
         )
         approval = run_agent(
             reviewer,
+            "approve plan",
             build_plan_approval_prompt(goal, base, plan_rel),
             repo,
             dry_run,
             log,
+            trace,
             codex_model,
             codex_effort,
             claude_model,
             claude_effort,
+            artifact=plan_rel,
         )
         if dry_run:
             approval = PLAN_APPROVAL_TOKEN
@@ -580,6 +632,7 @@ def run_local_review_loop(
     max_rounds: int,
     dry_run: bool,
     log: pathlib.Path,
+    trace: WorkflowTrace,
     codex_model: str | None,
     codex_effort: str | None,
     claude_model: str | None,
@@ -589,33 +642,40 @@ def run_local_review_loop(
     for round_index in range(1, max_rounds + 1):
         review_path = repo / ".a2a" / "reviews" / f"review-{round_index}.md"
         review_rel = repo_relative(repo, review_path)
-        print(f"[loop] local review round {round_index}/{max_rounds} with {reviewer}: {review_rel}")
+        trace.event(f"local review round {round_index}/{max_rounds}: {review_rel}")
         review = run_agent(
             reviewer,
+            "review local diff",
             build_local_review_prompt(goal, base, plan_rel, review_rel),
             repo,
             dry_run,
             log,
+            trace,
             codex_model,
             codex_effort,
             claude_model,
             claude_effort,
+            artifact=review_rel,
         )
         if dry_run:
             review = APPROVAL_TOKEN
         if APPROVAL_TOKEN in review:
+            trace.event(f"review approved by {reviewer}")
             return True
 
         run_agent(
             implementer,
+            "fix local review comments",
             build_local_fix_prompt(goal, base, plan_rel, review_rel),
             repo,
             dry_run,
             log,
+            trace,
             codex_model,
             codex_effort,
             claude_model,
             claude_effort,
+            artifact=review_rel,
         )
 
     return False
@@ -630,38 +690,46 @@ def run_gh_review_loop(
     max_rounds: int,
     dry_run: bool,
     log: pathlib.Path,
+    trace: WorkflowTrace,
     codex_model: str | None,
     codex_effort: str | None,
     claude_model: str | None,
     claude_effort: str | None,
 ) -> bool:
     for round_index in range(1, max_rounds + 1):
-        print(f"[loop] GitHub review round {round_index}/{max_rounds} with {reviewer}")
+        trace.event(f"GitHub review round {round_index}/{max_rounds}: {pr_url}")
         review = run_agent(
             reviewer,
+            "review GitHub PR",
             build_gh_review_prompt(goal, pr_url),
             repo,
             dry_run,
             log,
+            trace,
             codex_model,
             codex_effort,
             claude_model,
             claude_effort,
+            artifact=pr_url,
         )
         if dry_run:
             review = APPROVAL_TOKEN
         if APPROVAL_TOKEN in review:
+            trace.event(f"GitHub review approved by {reviewer}")
             return True
         run_agent(
             implementer,
+            "fix GitHub review comments",
             build_gh_fix_prompt(goal, pr_url, review),
             repo,
             dry_run,
             log,
+            trace,
             codex_model,
             codex_effort,
             claude_model,
             claude_effort,
+            artifact=pr_url,
         )
         gh_text(
             repo,
@@ -740,6 +808,7 @@ def main() -> int:
     branch = args.branch or f"a2a/{stamp}"
     log_dir = pathlib.Path.cwd() / "a2a-logs" / stamp
     log = log_dir / "run.log"
+    trace = WorkflowTrace(log)
     goal = args.goal
     if args.plan:
         plan_path = resolve_repo_path(repo, args.plan)
@@ -751,6 +820,8 @@ def main() -> int:
         plan_path = repo / ".a2a" / "plans" / f"{slugify_goal(goal)}.plan.md"
 
     ensure_a2a_dirs(repo, args.dry_run)
+    trace.event(f"repo: {repo}")
+    trace.event(f"branch setup: {branch}")
     ensure_branch(repo, branch, args.dry_run, log)
 
     plan = negotiate_plan(
@@ -765,6 +836,7 @@ def main() -> int:
         args.skip_plan_review,
         args.dry_run,
         log,
+        trace,
         args.codex_model,
         args.codex_effort,
         args.claude_model,
@@ -774,18 +846,22 @@ def main() -> int:
 
     run_agent(
         args.implementer,
+        "implement approved plan",
         build_implement_prompt(goal, repo_relative(repo, plan_path), args.base),
         repo,
         args.dry_run,
         log,
+        trace,
         args.codex_model,
         args.codex_effort,
         args.claude_model,
         args.claude_effort,
+        artifact=repo_relative(repo, plan_path),
     )
 
     pr_url = ""
     if args.gh_review:
+        trace.event(f"opening or updating PR before GitHub review: base {args.base}, branch {branch}")
         pr_url = open_or_update_pr(repo, args.base, branch, goal, plan, args.dry_run, log)
         approved = run_gh_review_loop(
             repo,
@@ -796,6 +872,7 @@ def main() -> int:
             args.max_rounds,
             args.dry_run,
             log,
+            trace,
             args.codex_model,
             args.codex_effort,
             args.claude_model,
@@ -812,27 +889,30 @@ def main() -> int:
             args.max_rounds,
             args.dry_run,
             log,
+            trace,
             args.codex_model,
             args.codex_effort,
             args.claude_model,
             args.claude_effort,
         )
         if approved:
+            trace.event(f"opening or updating PR after local approval: base {args.base}, branch {branch}")
             pr_url = open_or_update_pr(repo, args.base, branch, goal, plan, args.dry_run, log)
 
     if not approved:
         pr_note = f" PR: {pr_url}" if pr_url else ""
-        print(f"[done] not approved within {args.max_rounds} review rounds.{pr_note}")
-        print(f"[logs] {log}")
+        trace.event(f"not approved within {args.max_rounds} review rounds.{pr_note}")
+        trace.event(f"logs: {log}")
         return 2
 
-    print(f"[done] approved by {args.reviewer}. PR: {pr_url}")
+    trace.event(f"approved by {args.reviewer}. PR: {pr_url}")
     if args.merge:
+        trace.event(f"merge requested: squash {pr_url}")
         gh_text(repo, ["pr", "merge", pr_url, "--squash", "--delete-branch"], args.dry_run, log)
-        print("[done] squash merge requested")
+        trace.event("squash merge requested")
     else:
-        print("[done] merge skipped; pass --merge to squash merge automatically")
-    print(f"[logs] {log}")
+        trace.event("merge skipped; pass --merge to squash merge automatically")
+    trace.event(f"logs: {log}")
     return 0
 
 
