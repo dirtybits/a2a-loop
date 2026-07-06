@@ -11,7 +11,7 @@ coordinator may also assign any role to `claude` or `codex`.
 
 1. **Human supplies target goal.**
 2. **Claude plans.**
-   - Writes `.a2a/plans/<goal-slug>.plan.md`.
+   - Writes `.a2a/plans/<run-id>-<goal-slug>.plan.md`.
    - Produces an implementation plan, acceptance criteria, and test expectations.
 3. **Codex reviews the plan.**
    - Adds repo-specific fixes, risks, and test improvements to the plan.
@@ -25,7 +25,7 @@ coordinator may also assign any role to `claude` or `codex`.
    - Commits locally.
 6. **Claude reviews local diff.**
    - Reads `git diff <base>...HEAD`.
-   - Writes `.a2a/reviews/review-N.md`.
+   - Writes `.a2a/reviews/<run-id>/review-N.md`.
    - Emits a merge-clear decision or requests changes.
 7. **Codex fixes.**
    - Reads local review files.
@@ -67,13 +67,15 @@ IMPLEMENTATION_READY
 REVIEW_STATUS: changes_requested
 ```
 
-For the reviewer gate, require this exact line before merge:
+For the reviewer gate, require this exact line at the end of the reviewer's
+output before merge (a small trailing window tolerates CLI footers):
 
 ```text
 MERGE_DECISION: APPROVE
 ```
 
-Anything else keeps the loop alive or fails closed.
+Anything else — including prose that merely mentions the token — keeps the
+loop alive or fails closed.
 
 ## Safety Rails
 

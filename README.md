@@ -24,6 +24,7 @@ planner, implementer, and reviewer roles.
 
 ## Requirements
 
+- Python 3.11+
 - `codex` CLI with `codex exec`
 - `claude` CLI with `claude -p`
 - `gh` GitHub CLI authenticated for the target repo
@@ -94,18 +95,21 @@ files under `.a2a/`:
 
 ```text
 .a2a/
-  plans/<goal-slug>.plan.md
-  reviews/review-N.md
+  plans/<run-id>-<goal-slug>.plan.md
+  reviews/<run-id>/review-N.md
 ```
+
+Plans and reviews are namespaced by run id so concurrent or repeated runs with
+similar goals never share ledgers or reviews.
 
 At a high level:
 
 1. A human gives the loop a goal.
-2. Claude writes `.a2a/plans/<goal-slug>.plan.md`.
+2. Claude writes `.a2a/plans/<run-id>-<goal-slug>.plan.md`.
 3. Codex reviews the plan and adds repo-specific enhancements.
 4. Claude reviews the enhanced plan.
 5. If Claude emits `PLAN_STATUS: approved`, Codex implements locally and commits.
-6. Claude reviews `git diff <base>...HEAD` and writes `.a2a/reviews/review-N.md`.
+6. Claude reviews `git diff <base>...HEAD` and writes `.a2a/reviews/<run-id>/review-N.md`.
 7. If Claude requests changes, Codex fixes them locally and commits.
 8. The review/fix cycle repeats up to `--max-rounds`.
 9. If Claude emits `MERGE_DECISION: APPROVE`, the coordinator pushes and opens or updates a PR.
@@ -259,6 +263,13 @@ and role settings, and continues from the next incomplete phase. If the earlier
 run stopped after exhausting review rounds, `--max-rounds` on resume adds
 another bounded batch of rounds instead of restarting at `review-1.md`.
 
+Explicitly passed flags override the checkpoint on resume: `--planner`,
+`--implementer`, `--reviewer`, `--codex-model`, `--codex-effort`,
+`--claude-model`, `--claude-effort`, and `--claude-use-api-key`. Each applied
+override is printed as a `resume override:` trace line. Defaults resolved from
+config files do not override the checkpoint, so a plain `--resume` keeps the
+run's original settings.
+
 ## Safety
 
 - Run on a clean branch or disposable worktree.
@@ -268,16 +279,31 @@ another bounded batch of rounds instead of restarting at `review-1.md`.
 - Keep `--max-rounds` bounded.
 - Do not pass `--merge` until the dry-run and prompt contract look right.
 - The coordinator fails closed unless Claude emits `MERGE_DECISION: APPROVE`.
+- Approval tokens must appear as an exact line at the end of the reviewer's
+  output (a small trailing window tolerates CLI footers); reviewer prose that
+  merely quotes a token is not an approval.
 - The terminal shows defaults, artifact paths, agent steps, handoffs, approval,
   PR, and merge actions.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the writable
   run ledger so agent sandboxes can update todo statuses.
 - Logs are written to `.a2a/logs/<timestamp>/run.log` with the same status
-  breadcrumbs plus raw commands and agent output.
-- Local review stdout is persisted to `.a2a/reviews/review-N.md` if the reviewer
-  could not write the file directly.
+  breadcrumbs plus raw commands and agent output. Agent stdout streams into
+  the log as it arrives, so `tail -f` shows long turns live.
+- Local review stdout is persisted to `.a2a/reviews/<run-id>/review-N.md` if
+  the reviewer could not write the file directly.
 - Fatal agent output, such as unsupported-model API errors, stops the loop
   immediately and prints the captured stdout/stderr for the operator.
+- Each agent turn is bounded by a timeout (default 3600 seconds). Set
+  `A2A_AGENT_TIMEOUT_SECONDS` to adjust it, or to `0` to disable.
+
+## Tests
+
+Unit tests cover the pure helpers (slug/effort normalization, token matching,
+gitignore management, state round-trips):
+
+```bash
+python3 -m unittest discover tests
+```
 
 ## License
 

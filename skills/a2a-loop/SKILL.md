@@ -51,11 +51,11 @@ reviewed `.plan.md` files. The a2a coordinator stores working plans under
 Prefer the default local review mode. It saves tokens and avoids using GitHub
 comments as scratch space:
 
-- Claude writes `.a2a/plans/<goal-slug>.plan.md`.
+- Claude writes `.a2a/plans/<run-id>-<goal-slug>.plan.md`.
 - Codex enhances the plan.
 - Claude approves with `PLAN_STATUS: approved`.
 - Codex implements locally and commits.
-- Claude reviews `git diff <base>...HEAD` and writes `.a2a/reviews/review-N.md`.
+- Claude reviews `git diff <base>...HEAD` and writes `.a2a/reviews/<run-id>/review-N.md`.
 - Codex fixes locally until Claude emits `MERGE_DECISION: APPROVE`.
 - The coordinator then pushes and opens or updates the PR.
 
@@ -99,12 +99,17 @@ login/subscription auth by default; pass `--claude-use-api-key` or set
   run ledger so agent sandboxes can update todo statuses.
 - Inspect `.a2a/logs/<timestamp>/run.log`, `.a2a/plans/`, and `.a2a/reviews/`
   when debugging a run.
-- Local review stdout is persisted to `.a2a/reviews/review-N.md` if the
-  reviewer could not write the file directly.
+- Local review stdout is persisted to `.a2a/reviews/<run-id>/review-N.md` if
+  the reviewer could not write the file directly.
 - Real runs checkpoint to `.a2a/runs/<run-id>/state.json`; use
   `a2a-loop --resume <run-id>` to continue from the next incomplete phase.
 - On resume, `--max-plan-rounds` and `--max-rounds` add another bounded batch
-  from the saved next round.
+  from the saved next round. Explicitly passed role/model/effort flags
+  override the checkpoint and are echoed as `resume override:` trace lines.
+- Approval tokens must be an exact line at the end of the reviewer output;
+  prose that merely mentions a token does not approve.
+- Each agent turn times out after `A2A_AGENT_TIMEOUT_SECONDS` (default 3600;
+  `0` disables).
 - Fatal agent output, such as unsupported-model API errors, should halt the
   loop immediately with captured stdout/stderr visible to the operator.
 

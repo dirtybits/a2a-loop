@@ -19,16 +19,17 @@ import shlex
 import subprocess
 import sys
 import textwrap
+import threading
+import tomllib
 from dataclasses import asdict, dataclass
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
-    tomllib = None
 
 
 APPROVAL_TOKEN = "MERGE_DECISION: APPROVE"
 PLAN_APPROVAL_TOKEN = "PLAN_STATUS: approved"
+# The loop only ever checks for the approval tokens. Any other reviewer
+# output, including these changes-requested tokens, fails closed into
+# another review round; the tokens exist so prompts can name an explicit
+# alternative ending.
 PLAN_CHANGES_TOKEN = "PLAN_STATUS: changes_requested"
 REVIEW_CHANGES_TOKEN = "REVIEW_STATUS: changes_requested"
 AGENTS = ("claude", "codex")
@@ -55,6 +56,14 @@ AGENT_FATAL_PATTERNS = (
     "unexpected status 400 Bad Request",
     "requires a newer version of Codex",
 )
+DEFAULT_AGENT_TIMEOUT_SECONDS = 3600
+# Fatal CLI errors surface on stderr or near the end of the transcript;
+# scanning full stdout false-positives on diffs that merely quote them.
+FATAL_SCAN_STDOUT_TAIL_LINES = 40
+
+
+def warn(message: str) -> None:
+    print(f"[a2a-loop] warning: {message}", file=sys.stderr)
 
 
 def env_default(name: str) -> str | None:
@@ -113,32 +122,25 @@ def sanitize_display_value(value: object) -> str | None:
 
 
 def read_codex_cli_defaults() -> tuple[str | None, str | None]:
+    # Config files only feed defaults, so invalid values are dropped with a
+    # warning instead of aborting; explicit flags/env still validate strictly.
     path = pathlib.Path.home() / ".codex" / "config.toml"
     if not path.exists():
         return None, None
-    if tomllib is None:
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
-            return None, None
-        model = read_simple_toml_string(raw, "model")
-        effort = read_simple_toml_string(raw, "model_reasoning_effort")
-        return model, normalize_codex_effort(effort)
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError):
         return None, None
     model = sanitize_display_value(data.get("model"))
     effort = sanitize_display_value(data.get("model_reasoning_effort"))
-    return model, normalize_codex_effort(effort)
-
-
-def read_simple_toml_string(raw: str, key: str) -> str | None:
-    pattern = rf"(?m)^\s*{re.escape(key)}\s*=\s*(['\"])(.*?)\1\s*(?:#.*)?$"
-    match = re.search(pattern, raw)
-    if not match:
-        return None
-    return sanitize_display_value(match.group(2))
+    if effort is not None:
+        normalized = CODEX_EFFORT_ALIASES.get(effort, effort)
+        if normalized not in CODEX_EFFORTS:
+            warn(f"ignoring invalid model_reasoning_effort in {CODEX_CONFIG_SOURCE}: {effort}")
+            effort = None
+        else:
+            effort = normalized
+    return model, effort
 
 
 def read_claude_cli_defaults() -> tuple[str | None, str | None]:
@@ -151,7 +153,32 @@ def read_claude_cli_defaults() -> tuple[str | None, str | None]:
         return None, None
     model = sanitize_display_value(data.get("model"))
     effort = sanitize_display_value(data.get("effort"))
+    if effort is not None and effort not in CLAUDE_EFFORTS:
+        warn(f"ignoring invalid effort in {CLAUDE_SETTINGS_SOURCE}: {effort}")
+        effort = None
     return model, effort
+
+
+def ends_with_token(output: str, token: str, window: int = 5) -> bool:
+    """True when one of the final non-empty lines is exactly `token`.
+
+    The prompts require the token to be the ending of the response. A small
+    window tolerates trailing CLI chrome (e.g. codex exec usage footers)
+    while still rejecting prose that merely mentions the token mid-sentence.
+    """
+    lines = [line.strip() for line in output.strip().splitlines() if line.strip()]
+    return token in lines[-window:]
+
+
+def agent_timeout_seconds() -> int | None:
+    value = env_default("A2A_AGENT_TIMEOUT_SECONDS")
+    if value is None:
+        return DEFAULT_AGENT_TIMEOUT_SECONDS
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise SystemExit(f"A2A_AGENT_TIMEOUT_SECONDS must be an integer: {value}")
+    return seconds if seconds > 0 else None
 
 
 @dataclass
@@ -293,6 +320,7 @@ def run(
     dry_run: bool,
     log_file: pathlib.Path,
     env: dict[str, str] | None = None,
+    timeout: int | None = None,
 ) -> CmdResult:
     rendered = " ".join(shlex.quote(a) for a in args)
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -305,7 +333,7 @@ def run(
             f.write("[dry-run] skipped\n")
         return CmdResult(args=args, returncode=0, stdout="", stderr="")
 
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         args,
         cwd=str(cwd),
         text=True,
@@ -313,18 +341,54 @@ def run(
         stderr=subprocess.PIPE,
         env=env,
     )
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def pump_stdout() -> None:
+        # Stream stdout into the run log as it arrives so long agent turns
+        # stay observable via tail -f instead of appearing all at once.
+        assert proc.stdout is not None
+        with log_file.open("a", encoding="utf-8") as f:
+            for line in proc.stdout:
+                stdout_lines.append(line)
+                f.write(line)
+                f.flush()
+
+    def pump_stderr() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_lines.append(line)
+
+    pumps = [
+        threading.Thread(target=pump_stdout, daemon=True),
+        threading.Thread(target=pump_stderr, daemon=True),
+    ]
+    for pump in pumps:
+        pump.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        proc.wait()
+    for pump in pumps:
+        pump.join()
+
+    stdout = "".join(stdout_lines)
+    stderr = "".join(stderr_lines)
     with log_file.open("a", encoding="utf-8") as f:
-        if proc.stdout:
-            f.write(proc.stdout)
-        if proc.stderr:
+        if stderr:
             f.write("\n[stderr]\n")
-            f.write(proc.stderr)
-    return CmdResult(args=args, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+            f.write(stderr)
+    result = CmdResult(args=args, returncode=proc.returncode, stdout=stdout, stderr=stderr)
+    if timed_out:
+        raise SystemExit(format_command_failure("Command", result, f"timed out after {timeout}s"))
+    return result
 
 
 def require_ok(result: CmdResult, context: str) -> None:
     if result.returncode != 0:
-        rendered = " ".join(shlex.quote(a) for a in result.args)
         raise SystemExit(format_command_failure(context, result, f"exit code {result.returncode}"))
 
 
@@ -341,7 +405,8 @@ def format_command_failure(context: str, result: CmdResult, reason: str) -> str:
 
 
 def require_no_agent_error(result: CmdResult, context: str) -> None:
-    combined = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    stdout_tail = "\n".join(result.stdout.splitlines()[-FATAL_SCAN_STDOUT_TAIL_LINES:])
+    combined = "\n".join(part for part in (stdout_tail, result.stderr) if part)
     for pattern in AGENT_FATAL_PATTERNS:
         if pattern in combined:
             raise SystemExit(format_command_failure(context, result, f"fatal agent output: {pattern}"))
@@ -385,6 +450,7 @@ def claude_print(
         dry_run=dry_run,
         log_file=log,
         env=claude_env(use_api_key),
+        timeout=agent_timeout_seconds(),
     )
     require_ok(result, "Claude turn")
     require_no_agent_error(result, "Claude turn")
@@ -420,6 +486,7 @@ def codex_exec(
         cwd=repo,
         dry_run=dry_run,
         log_file=log,
+        timeout=agent_timeout_seconds(),
     )
     require_ok(result, "Codex turn")
     require_no_agent_error(result, "Codex turn")
@@ -434,35 +501,29 @@ def run_agent(
     dry_run: bool,
     log: pathlib.Path,
     trace: WorkflowTrace,
-    codex_model: str | None,
-    codex_effort: str | None,
-    codex_display_model: str,
-    codex_display_effort: str,
-    claude_model: str | None,
-    claude_effort: str | None,
-    claude_display_model: str,
-    claude_display_effort: str,
-    claude_use_api_key: bool,
+    state: RunState,
     artifact: str | None = None,
 ) -> str:
     if agent == "claude":
-        model = claude_display_model
-        effort = claude_display_effort
+        model = state.claude_display_model
+        effort = state.claude_display_effort
         step = trace.start_agent(agent, phase, model, effort, artifact)
-        output = claude_print(prompt, repo, dry_run, log, claude_model, claude_effort, claude_use_api_key)
+        output = claude_print(
+            prompt, repo, dry_run, log, state.claude_model, state.claude_effort, state.claude_use_api_key
+        )
         trace.finish_agent(agent, step, phase, model, effort, output)
         return output
     if agent == "codex":
-        model = codex_display_model
-        effort = codex_display_effort
+        model = state.codex_display_model
+        effort = state.codex_display_effort
         step = trace.start_agent(agent, phase, model, effort, artifact)
-        output = codex_exec(prompt, repo, dry_run, log, codex_model, codex_effort)
+        output = codex_exec(prompt, repo, dry_run, log, state.codex_model, state.codex_effort)
         trace.finish_agent(agent, step, phase, model, effort, output)
         return output
     raise ValueError(f"Unsupported agent: {agent}")
 
 
-def gh_json(repo: pathlib.Path, args: list[str], dry_run: bool, log: pathlib.Path) -> dict:
+def gh_json(repo: pathlib.Path, args: list[str], dry_run: bool, log: pathlib.Path) -> list | dict:
     result = run(["gh", *args], cwd=repo, dry_run=dry_run, log_file=log)
     require_ok(result, "gh command")
     if dry_run or not result.stdout.strip():
@@ -474,12 +535,6 @@ def gh_text(repo: pathlib.Path, args: list[str], dry_run: bool, log: pathlib.Pat
     result = run(["gh", *args], cwd=repo, dry_run=dry_run, log_file=log)
     require_ok(result, "gh command")
     return result.stdout
-
-
-def current_branch(repo: pathlib.Path, dry_run: bool, log: pathlib.Path) -> str:
-    result = run(["git", "branch", "--show-current"], cwd=repo, dry_run=dry_run, log_file=log)
-    require_ok(result, "branch detection")
-    return result.stdout.strip() or "a2a/dry-run"
 
 
 def ensure_branch(repo: pathlib.Path, branch: str, dry_run: bool, log: pathlib.Path) -> None:
@@ -650,7 +705,10 @@ def open_or_update_pr(
     if dry_run:
         return "DRY_RUN_PR"
     if isinstance(existing, list) and existing:
-        return existing[0]["url"]
+        url = existing[0].get("url")
+        if not url:
+            raise SystemExit(f"Unexpected gh pr list output for branch {branch}: {existing!r}")
+        return url
 
     body = textwrap.dedent(
         f"""
@@ -908,15 +966,7 @@ def negotiate_plan(
                 dry_run,
                 log,
                 trace,
-                state.codex_model,
-                state.codex_effort,
-                state.codex_display_model,
-                state.codex_display_effort,
-                state.claude_model,
-                state.claude_effort,
-                state.claude_display_model,
-                state.claude_display_effort,
-                state.claude_use_api_key,
+                state,
                 artifact=plan_rel,
             )
         else:
@@ -947,15 +997,7 @@ def negotiate_plan(
             dry_run,
             log,
             trace,
-            state.codex_model,
-            state.codex_effort,
-            state.codex_display_model,
-            state.codex_display_effort,
-            state.claude_model,
-            state.claude_effort,
-            state.claude_display_model,
-            state.claude_display_effort,
-            state.claude_use_api_key,
+            state,
             artifact=plan_rel,
         )
         approval = run_agent(
@@ -966,20 +1008,12 @@ def negotiate_plan(
             dry_run,
             log,
             trace,
-            state.codex_model,
-            state.codex_effort,
-            state.codex_display_model,
-            state.codex_display_effort,
-            state.claude_model,
-            state.claude_effort,
-            state.claude_display_model,
-            state.claude_display_effort,
-            state.claude_use_api_key,
+            state,
             artifact=plan_rel,
         )
         if dry_run:
             approval = PLAN_APPROVAL_TOKEN
-        if PLAN_APPROVAL_TOKEN in approval:
+        if ends_with_token(approval, PLAN_APPROVAL_TOKEN):
             state.phase = "plan_ready"
             save_state(repo, state, dry_run, trace)
             return read_if_present(plan_path, "DRY_RUN_PLAN")
@@ -1001,8 +1035,13 @@ def run_local_review_loop(
     state: RunState,
 ) -> bool:
     plan_rel = repo_relative(repo, plan_path)
+    # Reviews are namespaced by run id so a stale review-N.md from an earlier
+    # run can never be mistaken for this run's review.
+    review_dir = repo / ".a2a" / "reviews" / state.run_id
+    if not dry_run:
+        review_dir.mkdir(parents=True, exist_ok=True)
     for round_index in range(state.local_review_round, state.max_rounds + 1):
-        review_path = repo / ".a2a" / "reviews" / f"review-{round_index}.md"
+        review_path = review_dir / f"review-{round_index}.md"
         review_rel = repo_relative(repo, review_path)
         trace.event(f"local review round {round_index}/{state.max_rounds}: {review_rel}")
         review = run_agent(
@@ -1013,21 +1052,13 @@ def run_local_review_loop(
             dry_run,
             log,
             trace,
-            state.codex_model,
-            state.codex_effort,
-            state.codex_display_model,
-            state.codex_display_effort,
-            state.claude_model,
-            state.claude_effort,
-            state.claude_display_model,
-            state.claude_display_effort,
-            state.claude_use_api_key,
+            state,
             artifact=review_rel,
         )
         persist_review_output(review_path, review, dry_run, trace)
         if dry_run:
             review = APPROVAL_TOKEN
-        if APPROVAL_TOKEN in review:
+        if ends_with_token(review, APPROVAL_TOKEN):
             trace.event(f"review approved by {state.reviewer}")
             state.phase = "approved"
             state.approved = True
@@ -1042,15 +1073,7 @@ def run_local_review_loop(
             dry_run,
             log,
             trace,
-            state.codex_model,
-            state.codex_effort,
-            state.codex_display_model,
-            state.codex_display_effort,
-            state.claude_model,
-            state.claude_effort,
-            state.claude_display_model,
-            state.claude_display_effort,
-            state.claude_use_api_key,
+            state,
             artifact=review_rel,
         )
         state.phase = "implementation_ready"
@@ -1077,20 +1100,12 @@ def run_gh_review_loop(
             dry_run,
             log,
             trace,
-            state.codex_model,
-            state.codex_effort,
-            state.codex_display_model,
-            state.codex_display_effort,
-            state.claude_model,
-            state.claude_effort,
-            state.claude_display_model,
-            state.claude_display_effort,
-            state.claude_use_api_key,
+            state,
             artifact=state.pr_url,
         )
         if dry_run:
             review = APPROVAL_TOKEN
-        if APPROVAL_TOKEN in review:
+        if ends_with_token(review, APPROVAL_TOKEN):
             trace.event(f"GitHub review approved by {state.reviewer}")
             state.phase = "approved"
             state.approved = True
@@ -1104,15 +1119,7 @@ def run_gh_review_loop(
             dry_run,
             log,
             trace,
-            state.codex_model,
-            state.codex_effort,
-            state.codex_display_model,
-            state.codex_display_effort,
-            state.claude_model,
-            state.claude_effort,
-            state.claude_display_model,
-            state.claude_display_effort,
-            state.claude_use_api_key,
+            state,
             artifact=state.pr_url,
         )
         gh_text(
@@ -1136,10 +1143,6 @@ def main() -> int:
     default_claude_model = env_default("A2A_CLAUDE_MODEL") or claude_cli_model
     default_claude_effort = env_default("A2A_CLAUDE_EFFORT") or claude_cli_effort or CLAUDE_DEFAULT_EFFORT
     default_claude_use_api_key = env_flag("A2A_CLAUDE_USE_API_KEY")
-    if default_claude_effort and default_claude_effort not in CLAUDE_EFFORTS:
-        raise SystemExit(
-            "Claude effort must be one of: " + ", ".join(CLAUDE_EFFORTS)
-        )
 
     parser = argparse.ArgumentParser(
         description="Run a bounded Codex <-> Claude PR loop.",
@@ -1194,6 +1197,10 @@ def main() -> int:
     )
     args = parser.parse_args()
     args.codex_effort = normalize_codex_effort(args.codex_effort)
+    # argparse choices do not validate defaults, so an effort injected via
+    # A2A_CLAUDE_EFFORT is checked here on the resolved value.
+    if args.claude_effort and args.claude_effort not in CLAUDE_EFFORTS:
+        raise SystemExit("Claude effort must be one of: " + ", ".join(CLAUDE_EFFORTS))
     codex_display_model = args.codex_model or "unknown"
     codex_display_effort = args.codex_effort or "unknown"
     claude_display_model = args.claude_model or "unknown"
@@ -1249,9 +1256,46 @@ def main() -> int:
         )
         if args.merge:
             state.merge = True
+        # Explicitly passed flags override the checkpoint; defaults resolved
+        # from config files do not, so a resume keeps the run's settings.
+        overrides: list[str] = []
+        if arg_was_passed("--planner"):
+            state.planner = args.planner
+            overrides.append(f"planner={args.planner}")
+        if arg_was_passed("--implementer"):
+            state.implementer = args.implementer
+            overrides.append(f"implementer={args.implementer}")
+        if arg_was_passed("--reviewer"):
+            state.reviewer = args.reviewer
+            overrides.append(f"reviewer={args.reviewer}")
+        if arg_was_passed("--codex-model"):
+            state.codex_model = args.codex_model
+            state.codex_display_model = args.codex_model or "unknown"
+            state.codex_model_source = "--codex-model"
+            overrides.append(f"codex-model={state.codex_display_model}")
+        if arg_was_passed("--codex-effort"):
+            state.codex_effort = args.codex_effort
+            state.codex_display_effort = args.codex_effort or "unknown"
+            state.codex_effort_source = "--codex-effort"
+            overrides.append(f"codex-effort={state.codex_display_effort}")
+        if arg_was_passed("--claude-model"):
+            state.claude_model = args.claude_model
+            state.claude_display_model = args.claude_model or "unknown"
+            state.claude_model_source = "--claude-model"
+            overrides.append(f"claude-model={state.claude_display_model}")
+        if arg_was_passed("--claude-effort"):
+            state.claude_effort = args.claude_effort
+            state.claude_display_effort = args.claude_effort or "unknown"
+            state.claude_effort_source = "--claude-effort"
+            overrides.append(f"claude-effort={state.claude_display_effort}")
+        if arg_was_passed("--claude-use-api-key"):
+            state.claude_use_api_key = True
+            overrides.append("claude-use-api-key=true")
         plan_path = resolve_repo_path(repo, pathlib.Path(state.plan_path))
         create_plan = False
         trace.event(f"resuming run {state.run_id} from {repo_relative(repo, loaded_path)}")
+        for override in overrides:
+            trace.event(f"resume override: {override}")
     else:
         repo = initial_repo
         if not args.goal and not args.plan:
@@ -1274,7 +1318,9 @@ def main() -> int:
             create_plan = False
         else:
             assert goal is not None
-            plan_path = repo / ".a2a" / "plans" / f"{slugify_goal(goal)}.plan.md"
+            # Namespaced by run id so runs with similar goals never share a
+            # plan ledger.
+            plan_path = repo / ".a2a" / "plans" / f"{stamp}-{slugify_goal(goal)}.plan.md"
             create_plan = True
         state = RunState(
             version=STATE_VERSION,
@@ -1344,15 +1390,7 @@ def main() -> int:
             args.dry_run,
             log,
             trace,
-            state.codex_model,
-            state.codex_effort,
-            state.codex_display_model,
-            state.codex_display_effort,
-            state.claude_model,
-            state.claude_effort,
-            state.claude_display_model,
-            state.claude_display_effort,
-            state.claude_use_api_key,
+            state,
             artifact=repo_relative(repo, plan_path),
         )
         state.phase = "implementation_ready"
