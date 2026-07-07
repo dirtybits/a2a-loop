@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -31,6 +32,49 @@ class SlugifyGoalTests(unittest.TestCase):
 
     def test_empty_falls_back(self):
         self.assertEqual(a2a.slugify_goal("!!!"), "a2a-plan")
+
+
+class BranchNameTests(unittest.TestCase):
+    def test_plan_name_strips_plan_md_suffix(self):
+        self.assertEqual(a2a.slugify_plan_name(pathlib.Path("phase-9.plan.md")), "phase-9")
+
+    def test_plan_name_falls_back_to_stem(self):
+        self.assertEqual(a2a.slugify_plan_name(pathlib.Path("docs/blueprint.md")), "blueprint")
+
+    def test_default_branch_uses_plan_slug_and_date(self):
+        branch = a2a.default_branch_name("phase-9", "20260707-052409-881334")
+        self.assertEqual(branch, "a2a/phase-9-20260707")
+
+
+class EnsureBranchTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = pathlib.Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        subprocess.run(["git", "init"], cwd=self.repo, check=True, stdout=subprocess.PIPE)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=self.repo, check=True)
+        (self.repo / "file.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "file.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=self.repo, check=True, stdout=subprocess.PIPE)
+        self.initial_branch = self.git("branch", "--show-current")
+        self.log = self.repo / "run.log"
+
+    def git(self, *args: str) -> str:
+        result = subprocess.run(["git", *args], cwd=self.repo, check=True, text=True, stdout=subprocess.PIPE)
+        return result.stdout.strip()
+
+    def test_existing_branch_is_not_reset(self):
+        a2a.ensure_branch(self.repo, "a2a/existing", dry_run=False, log=self.log)
+        branch_head = self.git("rev-parse", "HEAD")
+        subprocess.run(["git", "checkout", self.initial_branch], cwd=self.repo, check=True, stdout=subprocess.PIPE)
+        (self.repo / "file.txt").write_text("main moved\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "main moved"], cwd=self.repo, check=True, stdout=subprocess.PIPE)
+
+        a2a.ensure_branch(self.repo, "a2a/existing", dry_run=False, log=self.log)
+
+        self.assertEqual(self.git("branch", "--show-current"), "a2a/existing")
+        self.assertEqual(self.git("rev-parse", "HEAD"), branch_head)
 
 
 class NormalizeCodexEffortTests(unittest.TestCase):

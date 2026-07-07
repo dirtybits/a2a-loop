@@ -273,8 +273,12 @@ run's original settings.
 ## Safety
 
 - Run on a clean branch or disposable worktree.
+- Default branches are named `a2a/<plan-or-goal-slug>-<yyyymmdd>`.
+- Passing `--branch` checks out an existing branch if present, or creates it if
+  missing; it does not reset an existing branch.
 - `.a2a/` is ignored by default because it is local working memory.
-- `.a2a/` and legacy `a2a-logs/` are added to `.gitignore` automatically.
+- `.a2a/` and legacy `a2a-logs/` are added to `.gitignore` automatically after
+  branch setup, so the change stays isolated to the run branch.
 - Keep `--max-plan-rounds` bounded.
 - Keep `--max-rounds` bounded.
 - Do not pass `--merge` until the dry-run and prompt contract look right.

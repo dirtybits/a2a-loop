@@ -80,6 +80,8 @@ loop alive or fails closed.
 ## Safety Rails
 
 - Run in a disposable git worktree or clean branch.
+- Use human-readable run branches like `a2a/<plan-or-goal-slug>-<yyyymmdd>`.
+- Do not reset existing branches during setup; check them out as-is.
 - Keep `.a2a/` ignored unless a project intentionally wants to commit agent working memory.
 - Use bounded plan rounds, for example `--max-plan-rounds 2`.
 - Use bounded rounds, for example `--max-rounds 4`.

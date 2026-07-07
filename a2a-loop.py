@@ -374,6 +374,10 @@ def run(
         proc.wait()
     for pump in pumps:
         pump.join()
+    if proc.stdout:
+        proc.stdout.close()
+    if proc.stderr:
+        proc.stderr.close()
 
     stdout = "".join(stdout_lines)
     stderr = "".join(stderr_lines)
@@ -537,19 +541,43 @@ def gh_text(repo: pathlib.Path, args: list[str], dry_run: bool, log: pathlib.Pat
     return result.stdout
 
 
-def ensure_branch(repo: pathlib.Path, branch: str, dry_run: bool, log: pathlib.Path) -> None:
-    result = run(["git", "checkout", "-B", branch], cwd=repo, dry_run=dry_run, log_file=log)
-    require_ok(result, "branch setup")
-
-
 def checkout_branch(repo: pathlib.Path, branch: str, dry_run: bool, log: pathlib.Path) -> None:
     result = run(["git", "checkout", branch], cwd=repo, dry_run=dry_run, log_file=log)
     require_ok(result, "branch checkout")
 
 
+def branch_exists(repo: pathlib.Path, branch: str, dry_run: bool, log: pathlib.Path) -> bool:
+    result = run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=repo, dry_run=dry_run, log_file=log)
+    if dry_run:
+        return False
+    return result.returncode == 0
+
+
+def ensure_branch(repo: pathlib.Path, branch: str, dry_run: bool, log: pathlib.Path) -> None:
+    if branch_exists(repo, branch, dry_run, log):
+        checkout_branch(repo, branch, dry_run, log)
+        return
+    result = run(["git", "checkout", "-b", branch], cwd=repo, dry_run=dry_run, log_file=log)
+    require_ok(result, "branch setup")
+
+
 def slugify_goal(goal: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", goal.lower()).strip("-")
     return slug[:64].strip("-") or "a2a-plan"
+
+
+def slugify_plan_name(path: pathlib.Path) -> str:
+    name = path.name
+    if name.endswith(".plan.md"):
+        name = name[: -len(".plan.md")]
+    else:
+        name = path.stem
+    return slugify_goal(name)
+
+
+def default_branch_name(plan_slug: str, stamp: str) -> str:
+    date = stamp.split("-", 1)[0]
+    return f"a2a/{plan_slug}-{date}"
 
 
 def repo_relative(repo: pathlib.Path, path: pathlib.Path) -> str:
@@ -1335,26 +1363,29 @@ def main() -> int:
             raise SystemExit("Either --goal, --plan, or --resume is required.")
 
         stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
-        branch = args.branch or f"a2a/{stamp}"
         log_dir = repo / ".a2a" / "logs" / stamp
         log = log_dir / "run.log"
         trace = WorkflowTrace(log)
         goal = args.goal
         source_plan_path = None
+        plan_slug = ""
         if args.plan:
             plan_path = resolve_repo_path(repo, args.plan)
             if not plan_path.exists():
                 raise SystemExit(f"Plan does not exist: {plan_path}")
             goal = goal or f"Execute plan {repo_relative(repo, plan_path)}"
             source_plan_path = repo_relative(repo, plan_path)
+            plan_slug = slugify_plan_name(plan_path)
             plan_path = materialize_working_plan(repo, plan_path, stamp, args.dry_run, trace)
             create_plan = False
         else:
             assert goal is not None
+            plan_slug = slugify_goal(goal)
             # Namespaced by run id so runs with similar goals never share a
             # plan ledger.
-            plan_path = repo / ".a2a" / "plans" / f"{stamp}-{slugify_goal(goal)}.plan.md"
+            plan_path = repo / ".a2a" / "plans" / f"{stamp}-{plan_slug}.plan.md"
             create_plan = True
+        branch = args.branch or default_branch_name(plan_slug, stamp)
         state = RunState(
             version=STATE_VERSION,
             run_id=stamp,
@@ -1395,13 +1426,13 @@ def main() -> int:
         + ("API key env inherited" if state.claude_use_api_key else "claude.ai login/subscription")
     )
     trace_run_defaults(repo, plan_path, state, trace)
-    ensure_gitignore(repo, args.dry_run, trace)
     if args.resume:
         trace.event(f"branch checkout: {state.branch}")
         checkout_branch(repo, state.branch, args.dry_run, log)
     else:
         trace.event(f"branch setup: {state.branch}")
         ensure_branch(repo, state.branch, args.dry_run, log)
+        ensure_gitignore(repo, args.dry_run, trace)
         save_state(repo, state, args.dry_run, trace)
 
     plan = negotiate_plan(

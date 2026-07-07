@@ -89,6 +89,9 @@ login/subscription auth by default; pass `--claude-use-api-key` or set
 ## Safety Defaults
 
 - Keep `.a2a/` as local working memory; the coordinator adds it to `.gitignore`.
+- Expect default branches like `a2a/<plan-or-goal-slug>-<yyyymmdd>`.
+- If `--branch` names an existing branch, the coordinator should check it out
+  without resetting it.
 - Keep legacy `a2a-logs/` ignored for runs created by older coordinator versions.
 - Keep `--max-plan-rounds` and `--max-rounds` bounded.
 - Prefer a clean branch or disposable worktree for target projects.
