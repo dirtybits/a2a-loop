@@ -51,13 +51,17 @@ reviewed `.plan.md` files. The a2a coordinator stores working plans under
 Prefer the default local review mode. It saves tokens and avoids using GitHub
 comments as scratch space:
 
-- Claude writes `.a2a/plans/<run-id>-<goal-slug>.plan.md`.
-- Codex enhances the plan.
-- Claude approves with `PLAN_STATUS: approved`.
+- Claude returns the plan in stdout; the coordinator persists `.a2a/plans/<run-id>-<goal-slug>.plan.md`.
+- Codex returns the enhanced plan in stdout; the coordinator persists it.
+- Claude approves with `PLAN_STATUS: approved` or returns coordinator-persisted follow-up changes.
 - Codex implements locally; the coordinator commits the resulting diff.
-- Claude reviews `git diff <base>...HEAD` and writes `.a2a/reviews/<run-id>/review-N.md`.
+- Claude reviews `git diff <base>...HEAD` in stdout; the coordinator persists `.a2a/reviews/<run-id>/review-N.md`.
 - Codex fixes locally until Claude emits `MERGE_DECISION: APPROVE`.
 - The coordinator commits fixes, then pushes and opens or updates the PR.
+- Before creating a PR, the coordinator makes one final commit attempt and
+  verifies the branch has commits ahead of base. If not, it reports that there
+  is nothing to PR and prints `git log`, `git diff --stat`, and `git status`
+  commands for the operator.
 
 Use `--gh-review` only when the user wants GitHub PR comments to be the review
 surface before approval.
@@ -102,13 +106,16 @@ auth status:` from `claude auth status --json` at startup when applicable.
   approval, PR, and merge status.
 - Use `--verbose` or `A2A_VERBOSE=1` when the operator wants live agent
   stdout/stderr mirrored to the terminal.
-- Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the writable
-  run ledger so agent sandboxes can update todo statuses, then synced back to
-  the source plan after agent phases that may update it.
+- Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the run
+  ledger, and coordinator-persisted plan updates sync back to the source plan.
 - Inspect `.a2a/logs/<timestamp>/run.log`, `.a2a/plans/`, and `.a2a/reviews/`
   when debugging a run.
-- Local review stdout is persisted to `.a2a/reviews/<run-id>/review-N.md` if
-  the reviewer could not write the file directly.
+- Local review stdout is persisted to `.a2a/reviews/<run-id>/review-N.md`;
+  reviewers are not required to write review files directly.
+- Plan stdout and optional `A2A_PLAN_UPDATE` blocks are coordinator-persisted;
+  agents are not required to write `.a2a` plan files directly.
+- Optional `A2A_COMMIT_MESSAGE` blocks let agents suggest a commit subject; the
+  coordinator still creates the commit and falls back to a phase-derived message.
 - Real runs checkpoint to `.a2a/runs/<run-id>/state.json`; use
   `a2a-loop --resume <run-id>` to continue from the next incomplete phase.
 - On resume, `--max-plan-rounds` and `--max-rounds` add another bounded batch

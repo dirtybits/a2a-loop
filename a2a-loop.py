@@ -29,6 +29,8 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 compatibility
 
 
 APPROVAL_TOKEN = "MERGE_DECISION: APPROVE"
+PLAN_READY_TOKEN = "PLAN_READY"
+PLAN_REVIEW_READY_TOKEN = "PLAN_REVIEW_READY"
 PLAN_APPROVAL_TOKEN = "PLAN_STATUS: approved"
 # The loop only ever checks for the approval tokens. Any other reviewer
 # output, including these changes-requested tokens, fails closed into
@@ -36,6 +38,10 @@ PLAN_APPROVAL_TOKEN = "PLAN_STATUS: approved"
 # alternative ending.
 PLAN_CHANGES_TOKEN = "PLAN_STATUS: changes_requested"
 REVIEW_CHANGES_TOKEN = "REVIEW_STATUS: changes_requested"
+PLAN_UPDATE_BEGIN = "A2A_PLAN_UPDATE_BEGIN"
+PLAN_UPDATE_END = "A2A_PLAN_UPDATE_END"
+COMMIT_MESSAGE_BEGIN = "A2A_COMMIT_MESSAGE_BEGIN"
+COMMIT_MESSAGE_END = "A2A_COMMIT_MESSAGE_END"
 AGENTS = ("claude", "codex")
 STATE_VERSION = 1
 CODEX_EFFORTS = ("minimal", "low", "medium", "high")
@@ -843,6 +849,78 @@ def persist_review_output(path: pathlib.Path, output: str, dry_run: bool, trace:
     trace.event(f"persisted reviewer stdout: {path.name}")
 
 
+def strip_artifact_tokens(output: str, tokens: set[str]) -> str:
+    lines = output.strip().splitlines()
+    while lines and lines[-1].strip() in tokens:
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def persist_plan_markdown(
+    path: pathlib.Path,
+    output: str,
+    dry_run: bool,
+    trace: WorkflowTrace,
+    reason: str,
+    tokens: set[str],
+) -> bool:
+    plan = strip_artifact_tokens(output, tokens)
+    if not plan:
+        trace.event(f"plan output empty; no coordinator write for {path.name}")
+        return False
+    if dry_run:
+        trace.event(f"dry-run would persist plan stdout ({reason}): {path.name}")
+        return True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if existing.strip() == plan.strip():
+        trace.event(f"plan unchanged after {reason}: {path.name}")
+        return False
+    path.write_text(plan.rstrip() + "\n", encoding="utf-8")
+    trace.event(f"persisted plan stdout ({reason}): {path.name}")
+    return True
+
+
+def extract_sentinel_block(output: str, begin: str, end: str) -> str | None:
+    pattern = re.compile(
+        rf"{re.escape(begin)}\s*\n(?P<body>.*?)\n\s*{re.escape(end)}",
+        re.DOTALL,
+    )
+    match = pattern.search(output)
+    if not match:
+        return None
+    body = match.group("body").strip()
+    return body or None
+
+
+def extract_plan_update(output: str) -> str | None:
+    return extract_sentinel_block(output, PLAN_UPDATE_BEGIN, PLAN_UPDATE_END)
+
+
+def persist_plan_update_block(
+    path: pathlib.Path,
+    output: str,
+    dry_run: bool,
+    trace: WorkflowTrace,
+    reason: str,
+) -> bool:
+    plan = extract_plan_update(output)
+    if plan is None:
+        return False
+    return persist_plan_markdown(path, plan, dry_run, trace, reason, tokens=set())
+
+
+def extract_commit_message(output: str) -> str | None:
+    message = extract_sentinel_block(output, COMMIT_MESSAGE_BEGIN, COMMIT_MESSAGE_END)
+    if message is None:
+        return None
+    lines = [re.sub(r"\s+", " ", line).strip() for line in message.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return None
+    return lines[0][:120]
+
+
 def resolve_repo_path(repo: pathlib.Path, value: pathlib.Path) -> pathlib.Path:
     path = value.expanduser()
     if not path.is_absolute():
@@ -864,8 +942,6 @@ def open_or_update_pr(
     dry_run: bool,
     log: pathlib.Path,
 ) -> str:
-    push_result = run(["git", "push", "-u", "origin", branch], cwd=repo, dry_run=dry_run, log_file=log)
-    require_ok(push_result, "branch push")
     existing = gh_json(
         repo,
         ["pr", "list", "--head", branch, "--json", "number,url", "--limit", "1"],
@@ -879,6 +955,10 @@ def open_or_update_pr(
         if not url:
             raise SystemExit(f"Unexpected gh pr list output for branch {branch}: {existing!r}")
         return url
+
+    ensure_branch_has_pr_commits(repo, base, branch, dry_run, log)
+    push_result = run(["git", "push", "-u", "origin", branch], cwd=repo, dry_run=dry_run, log_file=log)
+    require_ok(push_result, "branch push")
 
     body = textwrap.dedent(
         f"""
@@ -914,6 +994,45 @@ def open_or_update_pr(
     ).strip()
 
 
+def ensure_branch_has_pr_commits(
+    repo: pathlib.Path,
+    base: str,
+    branch: str,
+    dry_run: bool,
+    log: pathlib.Path,
+) -> None:
+    if dry_run:
+        return
+    ahead = run(["git", "rev-list", "--count", f"{base}..{branch}"], cwd=repo, dry_run=dry_run, log_file=log)
+    require_ok(ahead, "PR commit preflight")
+    try:
+        count = int(ahead.stdout.strip())
+    except ValueError as exc:
+        raise SystemExit(f"Unexpected git rev-list output for {base}..{branch}: {ahead.stdout!r}") from exc
+    if count > 0:
+        return
+
+    status = run(["git", "status", "--porcelain"], cwd=repo, dry_run=dry_run, log_file=log)
+    require_ok(status, "working tree status after empty PR preflight")
+    dirty_hint = ""
+    if status.stdout.strip():
+        dirty_hint = "\n\nWorking tree still has uncommitted changes:\n" + status.stdout.strip()
+    else:
+        dirty_hint = (
+            "\n\nWorking tree is clean, so the approved run did not create any committable "
+            "source changes. It may have only updated ignored .a2a artifacts, or the agent "
+            "completed with no product diff."
+        )
+    raise SystemExit(
+        f"No PR opened: branch {branch} has no commits ahead of {base}."
+        f"{dirty_hint}\n\n"
+        "Inspect with:\n"
+        f"  git log --oneline {base}..{branch}\n"
+        f"  git diff --stat {base}...{branch}\n"
+        f"  git status --short\n"
+    )
+
+
 def commit_if_changed(
     repo: pathlib.Path,
     message: str,
@@ -947,6 +1066,10 @@ def short_commit_goal(goal: str) -> str:
     return re.sub(r"\s+", " ", goal).strip()[:64] or "a2a changes"
 
 
+def commit_message_from_output(output: str, fallback: str) -> str:
+    return extract_commit_message(output) or fallback
+
+
 def build_plan_prompt(goal: str, base: str, plan_path: str) -> str:
     return f"""
 You are the planner in an agent-to-agent workflow.
@@ -956,8 +1079,9 @@ Target goal:
 
 Base branch: {base}
 
-Write the implementation plan to:
+Return the complete implementation plan in stdout. The coordinator will persist it to:
 {plan_path}
+Do not include commentary outside the plan markdown except the final {PLAN_READY_TOKEN} line.
 
 Use the dirtybits/agent-skills `plan-writing` convention for `.plan.md` files:
 - Start with YAML frontmatter containing `name`, `overview`, `todos`, and `isProject`.
@@ -967,7 +1091,7 @@ Use the dirtybits/agent-skills `plan-writing` convention for `.plan.md` files:
   implementation steps, verification, rollout/rollback if relevant, and blockers.
 - Include enough repo-specific detail that the implementer can proceed without guessing.
 
-Do not edit source files. End your response with PLAN_READY.
+Do not write plan files yourself. Do not edit source files. End your response with {PLAN_READY_TOKEN}.
 """.strip()
 
 
@@ -980,15 +1104,17 @@ Goal:
 
 Base branch: {base}
 
-Read the plan at:
+Read the current plan at:
 {plan_path}
 
 Inspect the repo enough to catch missing steps, risky assumptions, weak tests,
-or repo-specific implementation details. Update the plan file in place by
-adding an "Implementer Review" or "Implementation Enhancements" section. Preserve the
-plan-writing frontmatter shape and keep todo ids stable.
+or repo-specific implementation details. Return the complete updated plan
+markdown in stdout, adding an "Implementer Review" or "Implementation
+Enhancements" section. Preserve the plan-writing frontmatter shape and keep
+todo ids stable.
+Do not include commentary outside the plan markdown except the final {PLAN_REVIEW_READY_TOKEN} line.
 
-Do not implement the feature yet. End your response with PLAN_REVIEW_READY.
+Do not write plan files yourself. Do not implement the feature yet. End your response with {PLAN_REVIEW_READY_TOKEN}.
 """.strip()
 
 
@@ -1001,17 +1127,18 @@ Goal:
 
 Base branch: {base}
 
-Review the enhanced plan at:
+Read and review the enhanced plan at:
 {plan_path}
 
 If the plan is ready for implementation, end with exactly:
 {PLAN_APPROVAL_TOKEN}
 
-If changes are still needed, update the plan file in place with a concise
-"Reviewer Follow-up" section and end with exactly:
+If changes are still needed, return the complete updated plan markdown in stdout
+with a concise "Reviewer Follow-up" section and end with exactly:
 {PLAN_CHANGES_TOKEN}
+Do not include commentary outside the plan markdown when returning changes.
 
-Do not implement the feature.
+Do not write plan files yourself. Do not implement the feature.
 """.strip()
 
 
@@ -1028,12 +1155,21 @@ Plan file:
 Instructions:
 - Read the plan file before editing.
 - Inspect the repo before editing.
-- Maintain plan todo statuses as work progresses: set started todos to
-  `in_progress` and completed, verified todos to `completed`.
+- Track plan todo status mentally while working. If todo status/body should
+  change, include a complete updated plan in stdout between:
+  {PLAN_UPDATE_BEGIN}
+  ...complete updated plan markdown...
+  {PLAN_UPDATE_END}
+  The coordinator will persist the plan update.
 - Implement the smallest complete change that satisfies the plan.
 - Run relevant tests/checks.
+- Optionally suggest the coordinator commit subject in stdout between:
+  {COMMIT_MESSAGE_BEGIN}
+  concise commit subject
+  {COMMIT_MESSAGE_END}
 - Do not commit. The coordinator will create the git commit after your turn.
 - Do not write to `.git`.
+- Do not write `.a2a` plan/review files yourself.
 - Do not push.
 - Do not merge.
 - End your final response with IMPLEMENTATION_READY or explain the blocker.
@@ -1059,20 +1195,20 @@ state over conversation history. Useful commands include:
 - git log --oneline {base}..HEAD
 - git diff {base}...HEAD
 
-Write your review to:
+Return your complete review in stdout. The coordinator will persist it to:
 {review_path}
 
 If changes are needed:
-- Include actionable findings in the review file.
+- Include actionable findings in your stdout review.
 - End your response with exactly:
 {REVIEW_CHANGES_TOKEN}
 
 If the implementation satisfies the goal and tests are adequate:
-- Write a concise approval summary in the review file.
+- Include a concise approval summary in your stdout review.
 - End your response with exactly:
 {APPROVAL_TOKEN}
 
-Do not merge, push, or edit source files.
+Do not write review files yourself. Do not merge, push, or edit source files.
 """.strip()
 
 
@@ -1092,11 +1228,21 @@ Review file:
 Instructions:
 - Read the plan and review files.
 - Inspect the local diff against `{base}`.
-- Maintain plan todo statuses as work progresses.
+- Track plan todo status mentally while working. If todo status/body should
+  change, include a complete updated plan in stdout between:
+  {PLAN_UPDATE_BEGIN}
+  ...complete updated plan markdown...
+  {PLAN_UPDATE_END}
+  The coordinator will persist the plan update.
 - Address all actionable review comments.
 - Run relevant tests/checks.
+- Optionally suggest the coordinator commit subject in stdout between:
+  {COMMIT_MESSAGE_BEGIN}
+  concise commit subject
+  {COMMIT_MESSAGE_END}
 - Do not commit. The coordinator will create the git commit after your turn.
 - Do not write to `.git`.
+- Do not write `.a2a` plan/review files yourself.
 - Do not push.
 - Do not merge.
 - End with IMPLEMENTATION_READY or explain the blocker.
@@ -1144,8 +1290,18 @@ Instructions:
 - Inspect PR comments and the diff.
 - Address all actionable comments.
 - Run relevant tests/checks.
+- If todo status/body should change, include a complete updated plan in stdout between:
+  {PLAN_UPDATE_BEGIN}
+  ...complete updated plan markdown...
+  {PLAN_UPDATE_END}
+  The coordinator will persist the plan update.
+- Optionally suggest the coordinator commit subject in stdout between:
+  {COMMIT_MESSAGE_BEGIN}
+  concise commit subject
+  {COMMIT_MESSAGE_END}
 - Do not commit or push. The coordinator will create the git commit and push after your turn.
 - Do not write to `.git`.
+- Do not write `.a2a` plan/review files yourself.
 - Do not merge.
 - End with IMPLEMENTATION_READY or explain the blocker.
 """.strip()
@@ -1163,8 +1319,8 @@ def negotiate_plan(
     plan_rel = repo_relative(repo, plan_path)
     if state.phase == "initialized":
         if create_plan:
-            trace.event(f"planning starts: {state.planner} writes {plan_rel}")
-            run_agent(
+            trace.event(f"planning starts: {state.planner} returns plan for {plan_rel}")
+            plan_output = run_agent(
                 state.planner,
                 "write implementation plan",
                 build_plan_prompt(state.goal, state.base, plan_rel),
@@ -1174,6 +1330,14 @@ def negotiate_plan(
                 trace,
                 state,
                 artifact=plan_rel,
+            )
+            persist_plan_markdown(
+                plan_path,
+                plan_output,
+                dry_run,
+                trace,
+                "planner stdout",
+                tokens={PLAN_READY_TOKEN},
             )
             sync_source_plan(repo, plan_path, state, dry_run, trace)
         else:
@@ -1196,7 +1360,7 @@ def negotiate_plan(
 
     for round_index in range(state.plan_review_round, state.max_plan_rounds + 1):
         trace.event(f"plan review round {round_index}/{state.max_plan_rounds}")
-        run_agent(
+        review_output = run_agent(
             state.implementer,
             "review and enhance plan",
             build_plan_review_prompt(state.goal, state.base, plan_rel),
@@ -1206,6 +1370,14 @@ def negotiate_plan(
             trace,
             state,
             artifact=plan_rel,
+        )
+        persist_plan_markdown(
+            plan_path,
+            review_output,
+            dry_run,
+            trace,
+            "implementer plan review stdout",
+            tokens={PLAN_REVIEW_READY_TOKEN},
         )
         sync_source_plan(repo, plan_path, state, dry_run, trace)
         approval = run_agent(
@@ -1226,6 +1398,16 @@ def negotiate_plan(
             state.phase = "plan_ready"
             save_state(repo, state, dry_run, trace)
             return read_if_present(plan_path, "DRY_RUN_PLAN")
+        if ends_with_token(approval, PLAN_CHANGES_TOKEN):
+            persist_plan_markdown(
+                plan_path,
+                approval,
+                dry_run,
+                trace,
+                "reviewer plan follow-up stdout",
+                tokens={PLAN_CHANGES_TOKEN},
+            )
+            sync_source_plan(repo, plan_path, state, dry_run, trace)
         state.plan_review_round = round_index + 1
         save_state(repo, state, dry_run, trace)
 
@@ -1274,7 +1456,7 @@ def run_local_review_loop(
             save_state(repo, state, dry_run, trace)
             return True
 
-        run_agent(
+        fix_output = run_agent(
             state.implementer,
             "fix local review comments",
             build_local_fix_prompt(state.goal, state.base, plan_rel, review_rel),
@@ -1285,10 +1467,14 @@ def run_local_review_loop(
             state,
             artifact=review_rel,
         )
+        persist_plan_update_block(plan_path, fix_output, dry_run, trace, f"local fix round {round_index} stdout")
         sync_source_plan(repo, plan_path, state, dry_run, trace)
         commit_if_changed(
             repo,
-            f"A2A review fixes round {round_index}: {short_commit_goal(state.goal)}",
+            commit_message_from_output(
+                fix_output,
+                f"A2A review fixes round {round_index}: {short_commit_goal(state.goal)}",
+            ),
             dry_run,
             log,
             trace,
@@ -1328,7 +1514,7 @@ def run_gh_review_loop(
             state.approved = True
             save_state(repo, state, dry_run, trace)
             return True
-        run_agent(
+        fix_output = run_agent(
             state.implementer,
             "fix GitHub review comments",
             build_gh_fix_prompt(state.goal, state.pr_url, review),
@@ -1340,10 +1526,14 @@ def run_gh_review_loop(
             artifact=state.pr_url,
         )
         plan_path = resolve_repo_path(repo, pathlib.Path(state.plan_path))
+        persist_plan_update_block(plan_path, fix_output, dry_run, trace, f"GitHub fix round {round_index} stdout")
         sync_source_plan(repo, plan_path, state, dry_run, trace)
         committed = commit_if_changed(
             repo,
-            f"A2A GitHub review fixes round {round_index}: {short_commit_goal(state.goal)}",
+            commit_message_from_output(
+                fix_output,
+                f"A2A GitHub review fixes round {round_index}: {short_commit_goal(state.goal)}",
+            ),
             dry_run,
             log,
             trace,
@@ -1632,7 +1822,7 @@ def main() -> int:
     )
 
     if state.phase == "plan_ready":
-        run_agent(
+        implement_output = run_agent(
             state.implementer,
             "implement approved plan",
             build_implement_prompt(state.goal, repo_relative(repo, plan_path), state.base),
@@ -1643,10 +1833,14 @@ def main() -> int:
             state,
             artifact=repo_relative(repo, plan_path),
         )
+        persist_plan_update_block(plan_path, implement_output, args.dry_run, trace, "implementation stdout")
         sync_source_plan(repo, plan_path, state, args.dry_run, trace)
         commit_if_changed(
             repo,
-            f"A2A implementation: {short_commit_goal(state.goal)}",
+            commit_message_from_output(
+                implement_output,
+                f"A2A implementation: {short_commit_goal(state.goal)}",
+            ),
             args.dry_run,
             log,
             trace,
@@ -1668,6 +1862,13 @@ def main() -> int:
     if state.gh_review:
         if not state.pr_url:
             trace.event(f"opening or updating PR before GitHub review: base {state.base}, branch {state.branch}")
+            commit_if_changed(
+                repo,
+                f"A2A final changes: {short_commit_goal(state.goal)}",
+                args.dry_run,
+                log,
+                trace,
+            )
             state.pr_url = open_or_update_pr(repo, state.base, state.branch, state.goal, plan, args.dry_run, log)
             state.phase = "pr_ready"
             save_state(repo, state, args.dry_run, trace)
@@ -1690,6 +1891,13 @@ def main() -> int:
         if approved:
             if not state.pr_url:
                 trace.event(f"opening or updating PR after local approval: base {state.base}, branch {state.branch}")
+                commit_if_changed(
+                    repo,
+                    f"A2A final changes: {short_commit_goal(state.goal)}",
+                    args.dry_run,
+                    log,
+                    trace,
+                )
                 state.pr_url = open_or_update_pr(repo, state.base, state.branch, state.goal, plan, args.dry_run, log)
                 save_state(repo, state, args.dry_run, trace)
 
