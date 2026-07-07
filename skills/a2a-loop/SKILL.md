@@ -96,7 +96,8 @@ login/subscription auth by default; pass `--claude-use-api-key` or set
 - Watch the terminal for defaults, artifact paths, agent step, handoff,
   approval, PR, and merge status.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the writable
-  run ledger so agent sandboxes can update todo statuses.
+  run ledger so agent sandboxes can update todo statuses, then synced back to
+  the source plan after agent phases that may update it.
 - Inspect `.a2a/logs/<timestamp>/run.log`, `.a2a/plans/`, and `.a2a/reviews/`
   when debugging a run.
 - Local review stdout is persisted to `.a2a/reviews/<run-id>/review-N.md` if

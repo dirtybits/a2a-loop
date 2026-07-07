@@ -285,7 +285,8 @@ run's original settings.
 - The terminal shows defaults, artifact paths, agent steps, handoffs, approval,
   PR, and merge actions.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the writable
-  run ledger so agent sandboxes can update todo statuses.
+  run ledger so agent sandboxes can update todo statuses, then synced back to
+  the source plan after agent phases that may update it.
 - Logs are written to `.a2a/logs/<timestamp>/run.log` with the same status
   breadcrumbs plus raw commands and agent output. Agent stdout streams into
   the log as it arrives, so `tail -f` shows long turns live.

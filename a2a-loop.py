@@ -620,6 +620,33 @@ def materialize_working_plan(
     return dest
 
 
+def sync_source_plan(
+    repo: pathlib.Path,
+    working_plan_path: pathlib.Path,
+    state: RunState,
+    dry_run: bool,
+    trace: WorkflowTrace,
+) -> None:
+    if not state.source_plan_path or state.source_plan_path == state.plan_path:
+        return
+    source_path = resolve_repo_path(repo, pathlib.Path(state.source_plan_path))
+    if dry_run:
+        trace.event(
+            f"dry-run would sync plan ledger back to source: "
+            f"{display_path(repo, working_plan_path)} -> {display_path(repo, source_path)}"
+        )
+        return
+    if not working_plan_path.exists():
+        trace.event(f"plan ledger missing; source sync skipped: {display_path(repo, working_plan_path)}")
+        return
+    working = working_plan_path.read_text(encoding="utf-8")
+    existing = source_path.read_text(encoding="utf-8") if source_path.exists() else ""
+    if working == existing:
+        return
+    source_path.write_text(working, encoding="utf-8")
+    trace.event(f"synced plan ledger back to source: {display_path(repo, source_path)}")
+
+
 def ensure_a2a_dirs(repo: pathlib.Path, dry_run: bool) -> None:
     if dry_run:
         return
@@ -969,6 +996,7 @@ def negotiate_plan(
                 state,
                 artifact=plan_rel,
             )
+            sync_source_plan(repo, plan_path, state, dry_run, trace)
         else:
             trace.event(f"using existing plan: {plan_rel}")
         state.phase = "plan_written"
@@ -1000,6 +1028,7 @@ def negotiate_plan(
             state,
             artifact=plan_rel,
         )
+        sync_source_plan(repo, plan_path, state, dry_run, trace)
         approval = run_agent(
             state.reviewer,
             "approve plan",
@@ -1011,6 +1040,7 @@ def negotiate_plan(
             state,
             artifact=plan_rel,
         )
+        sync_source_plan(repo, plan_path, state, dry_run, trace)
         if dry_run:
             approval = PLAN_APPROVAL_TOKEN
         if ends_with_token(approval, PLAN_APPROVAL_TOKEN):
@@ -1076,6 +1106,7 @@ def run_local_review_loop(
             state,
             artifact=review_rel,
         )
+        sync_source_plan(repo, plan_path, state, dry_run, trace)
         state.phase = "implementation_ready"
         state.local_review_round = round_index + 1
         save_state(repo, state, dry_run, trace)
@@ -1122,6 +1153,8 @@ def run_gh_review_loop(
             state,
             artifact=state.pr_url,
         )
+        plan_path = resolve_repo_path(repo, pathlib.Path(state.plan_path))
+        sync_source_plan(repo, plan_path, state, dry_run, trace)
         gh_text(
             repo,
             ["pr", "comment", state.pr_url, "--body", f"Implementer pushed fixes for round {round_index}."],
@@ -1393,6 +1426,7 @@ def main() -> int:
             state,
             artifact=repo_relative(repo, plan_path),
         )
+        sync_source_plan(repo, plan_path, state, args.dry_run, trace)
         state.phase = "implementation_ready"
         save_state(repo, state, args.dry_run, trace)
     elif state.phase == "implementation_ready":
