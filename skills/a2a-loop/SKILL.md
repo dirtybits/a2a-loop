@@ -84,7 +84,9 @@ default `high` when the settings file does not expose one. Override per run with
 compatibility aliases `extra-high`, `xhigh`, and `max` map to `high`. Claude
 effort supports `low|medium|high|xhigh|max`. Claude uses local claude.ai
 login/subscription auth by default; pass `--claude-use-api-key` or set
-`A2A_CLAUDE_USE_API_KEY=1` only when API-key billing is intentional.
+`A2A_CLAUDE_USE_API_KEY=1` only when API-key billing is intentional. The
+coordinator prints `Codex auth status:` from `codex login status` and `Claude
+auth status:` from `claude auth status --json` at startup when applicable.
 
 ## Safety Defaults
 
@@ -98,6 +100,8 @@ login/subscription auth by default; pass `--claude-use-api-key` or set
 - Do not merge unless the exact `MERGE_DECISION: APPROVE` token appears.
 - Watch the terminal for defaults, artifact paths, agent step, handoff,
   approval, PR, and merge status.
+- Use `--verbose` or `A2A_VERBOSE=1` when the operator wants live agent
+  stdout/stderr mirrored to the terminal.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the writable
   run ledger so agent sandboxes can update todo statuses, then synced back to
   the source plan after agent phases that may update it.

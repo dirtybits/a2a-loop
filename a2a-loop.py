@@ -154,9 +154,78 @@ def read_claude_cli_defaults() -> tuple[str | None, str | None]:
     model = sanitize_display_value(data.get("model"))
     effort = sanitize_display_value(data.get("effort"))
     if effort is not None and effort not in CLAUDE_EFFORTS:
-        warn(f"ignoring invalid effort in {CLAUDE_SETTINGS_SOURCE}: {effort}")
-        effort = None
+            warn(f"ignoring invalid effort in {CLAUDE_SETTINGS_SOURCE}: {effort}")
+            effort = None
     return model, effort
+
+
+def format_codex_auth_status(output: str, returncode: int) -> str:
+    lines = [
+        sanitize_display_value(line)
+        for line in output.splitlines()
+        if sanitize_display_value(line)
+    ]
+    lines = [line for line in lines if not line.startswith("WARNING:")]
+    if lines:
+        return "; ".join(lines)
+    return f"unknown; `codex login status` exited {returncode}"
+
+
+def codex_auth_status(repo: pathlib.Path, dry_run: bool, log: pathlib.Path) -> str:
+    if dry_run:
+        return "not checked in dry-run; run `codex login status` to inspect local login"
+    result = run(
+        ["codex", "login", "status"],
+        cwd=repo,
+        dry_run=False,
+        log_file=log,
+        timeout=30,
+        stream_output=False,
+    )
+    combined = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    return format_codex_auth_status(combined, result.returncode)
+
+
+def format_claude_auth_status(data: dict[str, object]) -> str:
+    logged_in = data.get("loggedIn")
+    auth_method = sanitize_display_value(data.get("authMethod")) or "unknown"
+    api_provider = sanitize_display_value(data.get("apiProvider"))
+    account = (
+        sanitize_display_value(data.get("email"))
+        or sanitize_display_value(data.get("accountEmail"))
+        or sanitize_display_value(data.get("username"))
+        or sanitize_display_value(data.get("account"))
+    )
+    status = "logged in" if logged_in is True else "not logged in" if logged_in is False else "unknown"
+    parts = [status, f"method={auth_method}"]
+    if account:
+        parts.append(f"account={account}")
+    if api_provider:
+        parts.append(f"provider={api_provider}")
+    return ", ".join(parts)
+
+
+def claude_auth_status(repo: pathlib.Path, dry_run: bool, log: pathlib.Path) -> str:
+    if dry_run:
+        return "not checked in dry-run; run `claude auth status` to inspect local login"
+    result = run(
+        ["claude", "auth", "status", "--json"],
+        cwd=repo,
+        dry_run=False,
+        log_file=log,
+        timeout=30,
+        stream_output=False,
+    )
+    if result.stdout.strip():
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return "unknown; `claude auth status --json` returned non-JSON output"
+        if isinstance(data, dict):
+            return format_claude_auth_status(data)
+    if result.stderr.strip():
+        return f"unknown; `claude auth status` exited {result.returncode}: {result.stderr.strip()}"
+    return f"unknown; `claude auth status` exited {result.returncode}"
 
 
 def ends_with_token(output: str, token: str, window: int = 5) -> bool:
@@ -268,6 +337,7 @@ class RunState:
     gh_review_round: int = 1
     pr_url: str = ""
     approved: bool = False
+    verbose: bool = False
 
 
 def state_path(repo: pathlib.Path, run_id: str) -> pathlib.Path:
@@ -311,6 +381,7 @@ def load_state(path: pathlib.Path) -> RunState:
     data.setdefault("claude_display_effort", data.get("claude_effort") or "unknown")
     data.setdefault("claude_model_source", "legacy checkpoint")
     data.setdefault("claude_effort_source", "legacy checkpoint")
+    data.setdefault("verbose", False)
     return RunState(**data)
 
 
@@ -321,6 +392,8 @@ def run(
     log_file: pathlib.Path,
     env: dict[str, str] | None = None,
     timeout: int | None = None,
+    stream_output: bool = False,
+    stream_label: str | None = None,
 ) -> CmdResult:
     rendered = " ".join(shlex.quote(a) for a in args)
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -343,6 +416,8 @@ def run(
     )
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
+    stdout_prefix = f"[{stream_label}:stdout] " if stream_label else ""
+    stderr_prefix = f"[{stream_label}:stderr] " if stream_label else ""
 
     def pump_stdout() -> None:
         # Stream stdout into the run log as it arrives so long agent turns
@@ -353,11 +428,15 @@ def run(
                 stdout_lines.append(line)
                 f.write(line)
                 f.flush()
+                if stream_output:
+                    print(f"{stdout_prefix}{line}", end="")
 
     def pump_stderr() -> None:
         assert proc.stderr is not None
         for line in proc.stderr:
             stderr_lines.append(line)
+            if stream_output:
+                print(f"{stderr_prefix}{line}", end="", file=sys.stderr)
 
     pumps = [
         threading.Thread(target=pump_stdout, daemon=True),
@@ -433,6 +512,7 @@ def claude_print(
     model: str | None,
     effort: str | None,
     use_api_key: bool,
+    verbose: bool = False,
 ) -> str:
     args = [
         "claude",
@@ -455,6 +535,8 @@ def claude_print(
         log_file=log,
         env=claude_env(use_api_key),
         timeout=agent_timeout_seconds(),
+        stream_output=verbose,
+        stream_label="claude",
     )
     require_ok(result, "Claude turn")
     require_no_agent_error(result, "Claude turn")
@@ -468,6 +550,7 @@ def codex_exec(
     log: pathlib.Path,
     model: str | None,
     effort: str | None,
+    verbose: bool = False,
 ) -> str:
     args = [
         "codex",
@@ -491,6 +574,8 @@ def codex_exec(
         dry_run=dry_run,
         log_file=log,
         timeout=agent_timeout_seconds(),
+        stream_output=verbose,
+        stream_label="codex",
     )
     require_ok(result, "Codex turn")
     require_no_agent_error(result, "Codex turn")
@@ -513,7 +598,14 @@ def run_agent(
         effort = state.claude_display_effort
         step = trace.start_agent(agent, phase, model, effort, artifact)
         output = claude_print(
-            prompt, repo, dry_run, log, state.claude_model, state.claude_effort, state.claude_use_api_key
+            prompt,
+            repo,
+            dry_run,
+            log,
+            state.claude_model,
+            state.claude_effort,
+            state.claude_use_api_key,
+            state.verbose,
         )
         trace.finish_agent(agent, step, phase, model, effort, output)
         return output
@@ -521,7 +613,7 @@ def run_agent(
         model = state.codex_display_model
         effort = state.codex_display_effort
         step = trace.start_agent(agent, phase, model, effort, artifact)
-        output = codex_exec(prompt, repo, dry_run, log, state.codex_model, state.codex_effort)
+        output = codex_exec(prompt, repo, dry_run, log, state.codex_model, state.codex_effort, state.verbose)
         trace.finish_agent(agent, step, phase, model, effort, output)
         return output
     raise ValueError(f"Unsupported agent: {agent}")
@@ -1204,6 +1296,7 @@ def main() -> int:
     default_claude_model = env_default("A2A_CLAUDE_MODEL") or claude_cli_model
     default_claude_effort = env_default("A2A_CLAUDE_EFFORT") or claude_cli_effort or CLAUDE_DEFAULT_EFFORT
     default_claude_use_api_key = env_flag("A2A_CLAUDE_USE_API_KEY")
+    default_verbose = env_flag("A2A_VERBOSE")
 
     parser = argparse.ArgumentParser(
         description="Run a bounded Codex <-> Claude PR loop.",
@@ -1249,6 +1342,12 @@ def main() -> int:
     )
     parser.add_argument("--gh-review", action="store_true", help="Use GitHub PR comments as the review surface.")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=default_verbose,
+        help="Mirror agent stdout/stderr to the terminal as each turn runs. Can also be set with A2A_VERBOSE=1.",
+    )
     parser.add_argument("--merge", action="store_true", help="Squash merge after reviewer approval.")
     parser.add_argument(
         "--claude-use-api-key",
@@ -1352,6 +1451,9 @@ def main() -> int:
         if arg_was_passed("--claude-use-api-key"):
             state.claude_use_api_key = True
             overrides.append("claude-use-api-key=true")
+        if arg_was_passed("--verbose") or default_verbose:
+            state.verbose = True
+            overrides.append("verbose=true")
         plan_path = resolve_repo_path(repo, pathlib.Path(state.plan_path))
         create_plan = False
         trace.event(f"resuming run {state.run_id} from {repo_relative(repo, loaded_path)}")
@@ -1416,15 +1518,23 @@ def main() -> int:
             claude_model_source=claude_model_source,
             claude_effort_source=claude_effort_source,
             claude_use_api_key=args.claude_use_api_key,
+            verbose=args.verbose,
             log_path=str(log),
         )
 
     ensure_a2a_dirs(repo, args.dry_run)
     trace.event(f"repo: {repo}")
+    if state.verbose:
+        trace.event("verbose output: agent stdout/stderr mirrored to terminal")
+    trace.event(f"Codex auth status: {codex_auth_status(repo, args.dry_run, log)}")
     trace.event(
         "Claude auth: "
         + ("API key env inherited" if state.claude_use_api_key else "claude.ai login/subscription")
     )
+    if state.claude_use_api_key:
+        trace.event("Claude auth status: skipped for API-key mode")
+    else:
+        trace.event(f"Claude auth status: {claude_auth_status(repo, args.dry_run, log)}")
     trace_run_defaults(repo, plan_path, state, trace)
     if args.resume:
         trace.event(f"branch checkout: {state.branch}")

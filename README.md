@@ -191,6 +191,18 @@ auth path by stripping API-key auth environment variables from Claude
 subprocesses. Pass `--claude-use-api-key` or set `A2A_CLAUDE_USE_API_KEY=1`
 when you intentionally want API-key billing.
 
+Codex uses the local Codex CLI auth selected with `codex login`. At startup, the
+coordinator prints `Codex auth status:` from `codex login status`. Current Codex
+CLI versions may report the auth mode, such as ChatGPT or API key, without
+exposing the exact account email.
+
+Use `claude auth login` to choose the Anthropic account/subscription used by
+headless `claude -p` runs. At startup, the coordinator prints `Claude auth
+status:` from `claude auth status --json` so you can confirm whether Claude is
+logged in and, when the CLI reports it, which account is active. In API-key
+mode, that account check is skipped because the subprocess inherits
+`ANTHROPIC_*` auth instead.
+
 The script shells out to three CLIs:
 
 ```text
@@ -288,6 +300,8 @@ run's original settings.
   merely quotes a token is not an approval.
 - The terminal shows defaults, artifact paths, agent steps, handoffs, approval,
   PR, and merge actions.
+- Pass `--verbose` or set `A2A_VERBOSE=1` to mirror agent stdout/stderr to the
+  terminal during each turn.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the writable
   run ledger so agent sandboxes can update todo statuses, then synced back to
   the source plan after agent phases that may update it.

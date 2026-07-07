@@ -6,11 +6,13 @@ Run with: python3 -m unittest discover tests
 from __future__ import annotations
 
 import importlib.util
+import io
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("a2a_loop", ROOT / "a2a-loop.py")
@@ -46,6 +48,50 @@ class BranchNameTests(unittest.TestCase):
         self.assertEqual(branch, "a2a/phase-9-20260707")
 
 
+class ClaudeAuthStatusTests(unittest.TestCase):
+    def test_logged_in_account_is_displayed(self):
+        status = a2a.format_claude_auth_status(
+            {
+                "loggedIn": True,
+                "authMethod": "subscription",
+                "email": "user@example.com",
+                "apiProvider": "firstParty",
+            }
+        )
+        self.assertEqual(
+            status,
+            "logged in, method=subscription, account=user@example.com, provider=firstParty",
+        )
+
+    def test_logged_out_status_is_displayed(self):
+        status = a2a.format_claude_auth_status(
+            {
+                "loggedIn": False,
+                "authMethod": "none",
+                "apiProvider": "firstParty",
+            }
+        )
+        self.assertEqual(status, "not logged in, method=none, provider=firstParty")
+
+
+class CodexAuthStatusTests(unittest.TestCase):
+    def test_login_status_is_displayed(self):
+        status = a2a.format_codex_auth_status("Logged in using ChatGPT\n", 0)
+        self.assertEqual(status, "Logged in using ChatGPT")
+
+    def test_warning_lines_are_ignored(self):
+        status = a2a.format_codex_auth_status(
+            "WARNING: proceeding, even though we could not create PATH aliases\n"
+            "Logged in using ChatGPT\n",
+            0,
+        )
+        self.assertEqual(status, "Logged in using ChatGPT")
+
+    def test_empty_status_reports_exit(self):
+        status = a2a.format_codex_auth_status("", 1)
+        self.assertEqual(status, "unknown; `codex login status` exited 1")
+
+
 class EnsureBranchTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -75,6 +121,43 @@ class EnsureBranchTests(unittest.TestCase):
 
         self.assertEqual(self.git("branch", "--show-current"), "a2a/existing")
         self.assertEqual(self.git("rev-parse", "HEAD"), branch_head)
+
+
+class RunOutputTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = pathlib.Path(self._tmp.name)
+        self.log = self.repo / "run.log"
+
+    def test_quiet_run_captures_without_terminal_output(self):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            result = a2a.run(
+                [sys.executable, "-c", "print('hello')"],
+                cwd=self.repo,
+                dry_run=False,
+                log_file=self.log,
+            )
+        self.assertEqual(result.stdout, "hello\n")
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_verbose_run_mirrors_labeled_output(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            result = a2a.run(
+                [sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr)"],
+                cwd=self.repo,
+                dry_run=False,
+                log_file=self.log,
+                stream_output=True,
+                stream_label="agent",
+            )
+        self.assertEqual(result.stdout, "out\n")
+        self.assertEqual(result.stderr, "err\n")
+        self.assertEqual(stdout.getvalue(), "[agent:stdout] out\n")
+        self.assertEqual(stderr.getvalue(), "[agent:stderr] err\n")
 
 
 class NormalizeCodexEffortTests(unittest.TestCase):
