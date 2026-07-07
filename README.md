@@ -13,7 +13,7 @@ diff:
 1. Claude plans.
 2. Codex reviews and enhances the plan.
 3. Claude approves the enhanced plan with `PLAN_STATUS: approved`.
-4. Codex implements locally and commits.
+4. Codex implements locally; the coordinator commits the resulting diff.
 5. Claude reviews the local diff.
 6. Codex addresses local review comments.
 7. Claude approves with `MERGE_DECISION: APPROVE`.
@@ -108,9 +108,9 @@ At a high level:
 2. Claude writes `.a2a/plans/<run-id>-<goal-slug>.plan.md`.
 3. Codex reviews the plan and adds repo-specific enhancements.
 4. Claude reviews the enhanced plan.
-5. If Claude emits `PLAN_STATUS: approved`, Codex implements locally and commits.
+5. If Claude emits `PLAN_STATUS: approved`, Codex implements locally and the coordinator commits the resulting diff.
 6. Claude reviews `git diff <base>...HEAD` and writes `.a2a/reviews/<run-id>/review-N.md`.
-7. If Claude requests changes, Codex fixes them locally and commits.
+7. If Claude requests changes, Codex fixes them locally and the coordinator commits the resulting diff.
 8. The review/fix cycle repeats up to `--max-rounds`.
 9. If Claude emits `MERGE_DECISION: APPROVE`, the coordinator pushes and opens or updates a PR.
 10. If `--merge` was passed, the coordinator squash-merges the PR.
@@ -121,7 +121,8 @@ and reviewer plan approval unless `--skip-plan-review` is passed.
 
 Use `--gh-review` when you explicitly want the older GitHub PR review surface.
 In that mode, the coordinator pushes and opens or updates the PR before review,
-Claude reviews the PR, and Codex pushes fixes back to the branch.
+Claude reviews the PR, then Codex fixes locally and the coordinator commits and
+pushes fixes back to the branch.
 
 ## Roles and Models
 
@@ -211,10 +212,11 @@ codex exec ...
 gh ...
 ```
 
-The key safety idea is that neither agent directly merges. Claude can only
-approve by printing the exact approval token, and the Python coordinator is the
-only thing that may call `gh pr merge`, and only when `--merge` is explicitly
-passed.
+The key safety idea is that agents edit working-tree files but do not write
+`.git`, push, or merge. Claude can only approve by printing the exact approval
+token, and the Python coordinator is the only thing that may create commits,
+push, or call `gh pr merge`, and merging only happens when `--merge` is
+explicitly passed.
 
 The important prompt-building and execution functions are:
 

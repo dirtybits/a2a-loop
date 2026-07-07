@@ -54,10 +54,10 @@ comments as scratch space:
 - Claude writes `.a2a/plans/<run-id>-<goal-slug>.plan.md`.
 - Codex enhances the plan.
 - Claude approves with `PLAN_STATUS: approved`.
-- Codex implements locally and commits.
+- Codex implements locally; the coordinator commits the resulting diff.
 - Claude reviews `git diff <base>...HEAD` and writes `.a2a/reviews/<run-id>/review-N.md`.
 - Codex fixes locally until Claude emits `MERGE_DECISION: APPROVE`.
-- The coordinator then pushes and opens or updates the PR.
+- The coordinator commits fixes, then pushes and opens or updates the PR.
 
 Use `--gh-review` only when the user wants GitHub PR comments to be the review
 surface before approval.

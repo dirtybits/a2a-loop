@@ -20,8 +20,12 @@ import subprocess
 import sys
 import textwrap
 import threading
-import tomllib
 from dataclasses import asdict, dataclass
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 compatibility
+    tomllib = None
 
 
 APPROVAL_TOKEN = "MERGE_DECISION: APPROVE"
@@ -127,20 +131,39 @@ def read_codex_cli_defaults() -> tuple[str | None, str | None]:
     path = pathlib.Path.home() / ".codex" / "config.toml"
     if not path.exists():
         return None, None
+    if tomllib is None:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            return None, None
+        model = read_simple_toml_string(raw, "model")
+        effort = read_simple_toml_string(raw, "model_reasoning_effort")
+        return model, normalize_config_codex_effort(effort)
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError):
         return None, None
     model = sanitize_display_value(data.get("model"))
     effort = sanitize_display_value(data.get("model_reasoning_effort"))
+    return model, normalize_config_codex_effort(effort)
+
+
+def read_simple_toml_string(raw: str, key: str) -> str | None:
+    pattern = rf"(?m)^\s*{re.escape(key)}\s*=\s*(['\"])(.*?)\1\s*(?:#.*)?$"
+    match = re.search(pattern, raw)
+    if not match:
+        return None
+    return sanitize_display_value(match.group(2))
+
+
+def normalize_config_codex_effort(effort: str | None) -> str | None:
     if effort is not None:
         normalized = CODEX_EFFORT_ALIASES.get(effort, effort)
         if normalized not in CODEX_EFFORTS:
             warn(f"ignoring invalid model_reasoning_effort in {CODEX_CONFIG_SOURCE}: {effort}")
-            effort = None
-        else:
-            effort = normalized
-    return model, effort
+            return None
+        return normalized
+    return None
 
 
 def read_claude_cli_defaults() -> tuple[str | None, str | None]:
@@ -891,6 +914,39 @@ def open_or_update_pr(
     ).strip()
 
 
+def commit_if_changed(
+    repo: pathlib.Path,
+    message: str,
+    dry_run: bool,
+    log: pathlib.Path,
+    trace: WorkflowTrace,
+) -> bool:
+    if dry_run:
+        trace.event(f"dry-run would create coordinator commit: {message}")
+        return True
+    status = run(["git", "status", "--porcelain"], cwd=repo, dry_run=dry_run, log_file=log)
+    require_ok(status, "working tree status")
+    if not status.stdout.strip():
+        trace.event(f"no changes to commit after: {message}")
+        return False
+    add_result = run(["git", "add", "-A"], cwd=repo, dry_run=dry_run, log_file=log)
+    require_ok(add_result, "stage coordinator commit")
+    diff_result = run(["git", "diff", "--cached", "--quiet"], cwd=repo, dry_run=dry_run, log_file=log)
+    if diff_result.returncode == 0:
+        trace.event(f"no staged changes to commit after: {message}")
+        return False
+    if diff_result.returncode != 1:
+        require_ok(diff_result, "staged diff check")
+    commit_result = run(["git", "commit", "-m", message], cwd=repo, dry_run=dry_run, log_file=log)
+    require_ok(commit_result, "coordinator commit")
+    trace.event(f"coordinator commit created: {message}")
+    return True
+
+
+def short_commit_goal(goal: str) -> str:
+    return re.sub(r"\s+", " ", goal).strip()[:64] or "a2a changes"
+
+
 def build_plan_prompt(goal: str, base: str, plan_path: str) -> str:
     return f"""
 You are the planner in an agent-to-agent workflow.
@@ -976,7 +1032,8 @@ Instructions:
   `in_progress` and completed, verified todos to `completed`.
 - Implement the smallest complete change that satisfies the plan.
 - Run relevant tests/checks.
-- Commit your changes to the current branch.
+- Do not commit. The coordinator will create the git commit after your turn.
+- Do not write to `.git`.
 - Do not push.
 - Do not merge.
 - End your final response with IMPLEMENTATION_READY or explain the blocker.
@@ -1038,7 +1095,8 @@ Instructions:
 - Maintain plan todo statuses as work progresses.
 - Address all actionable review comments.
 - Run relevant tests/checks.
-- Commit fixes to the current branch.
+- Do not commit. The coordinator will create the git commit after your turn.
+- Do not write to `.git`.
 - Do not push.
 - Do not merge.
 - End with IMPLEMENTATION_READY or explain the blocker.
@@ -1086,7 +1144,8 @@ Instructions:
 - Inspect PR comments and the diff.
 - Address all actionable comments.
 - Run relevant tests/checks.
-- Commit and push fixes to the same branch.
+- Do not commit or push. The coordinator will create the git commit and push after your turn.
+- Do not write to `.git`.
 - Do not merge.
 - End with IMPLEMENTATION_READY or explain the blocker.
 """.strip()
@@ -1227,6 +1286,13 @@ def run_local_review_loop(
             artifact=review_rel,
         )
         sync_source_plan(repo, plan_path, state, dry_run, trace)
+        commit_if_changed(
+            repo,
+            f"A2A review fixes round {round_index}: {short_commit_goal(state.goal)}",
+            dry_run,
+            log,
+            trace,
+        )
         state.phase = "implementation_ready"
         state.local_review_round = round_index + 1
         save_state(repo, state, dry_run, trace)
@@ -1275,6 +1341,16 @@ def run_gh_review_loop(
         )
         plan_path = resolve_repo_path(repo, pathlib.Path(state.plan_path))
         sync_source_plan(repo, plan_path, state, dry_run, trace)
+        committed = commit_if_changed(
+            repo,
+            f"A2A GitHub review fixes round {round_index}: {short_commit_goal(state.goal)}",
+            dry_run,
+            log,
+            trace,
+        )
+        if committed:
+            push_result = run(["git", "push"], cwd=repo, dry_run=dry_run, log_file=log)
+            require_ok(push_result, "push coordinator fixes")
         gh_text(
             repo,
             ["pr", "comment", state.pr_url, "--body", f"Implementer pushed fixes for round {round_index}."],
@@ -1464,7 +1540,7 @@ def main() -> int:
         if not args.goal and not args.plan:
             raise SystemExit("Either --goal, --plan, or --resume is required.")
 
-        stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
         log_dir = repo / ".a2a" / "logs" / stamp
         log = log_dir / "run.log"
         trace = WorkflowTrace(log)
@@ -1568,6 +1644,13 @@ def main() -> int:
             artifact=repo_relative(repo, plan_path),
         )
         sync_source_plan(repo, plan_path, state, args.dry_run, trace)
+        commit_if_changed(
+            repo,
+            f"A2A implementation: {short_commit_goal(state.goal)}",
+            args.dry_run,
+            log,
+            trace,
+        )
         state.phase = "implementation_ready"
         save_state(repo, state, args.dry_run, trace)
     elif state.phase == "implementation_ready":
