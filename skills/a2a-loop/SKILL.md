@@ -105,12 +105,12 @@ auth status:` from `claude auth status --json` at startup when applicable.
 - Watch the terminal for defaults, artifact paths, agent step, handoff,
   approval, PR, and merge status.
 - Use `--verbose` or `A2A_VERBOSE=1` when the operator wants a summarized live
-  trace of public agent text, tool calls/results, stderr, and post-turn
-  diffstats. Raw command output still goes to the run log.
+  trace of public non-code agent text, tool calls, stderr, and post-turn
+  diffstats. Code snippets and raw tool output stay in the run log.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the run
   ledger, and coordinator-persisted plan updates sync back to the source plan.
-- Inspect `.a2a/logs/<timestamp>/run.log`, `.a2a/plans/`, and `.a2a/reviews/`
-  when debugging a run.
+- Inspect `.a2a/logs/<timestamp>/run.log`, `.a2a/runs/<run-id>/decisions.md`,
+  `.a2a/plans/`, and `.a2a/reviews/` when debugging a run.
 - Local review stdout is persisted to `.a2a/reviews/<run-id>/review-N.md`;
   reviewers are not required to write review files directly.
 - Plan stdout and optional `A2A_PLAN_UPDATE` blocks are coordinator-persisted;
@@ -119,9 +119,12 @@ auth status:` from `claude auth status --json` at startup when applicable.
   coordinator still creates the commit and falls back to a phase-derived message.
 - Real runs checkpoint to `.a2a/runs/<run-id>/state.json`; use
   `a2a-loop --resume <run-id>` to continue from the next incomplete phase.
+  Use bare `a2a-loop --resume` to resume the newest checkpoint under
+  `.a2a/runs/`, equivalent to picking the latest `ls -td .a2a/runs/* | head`.
 - On resume, `--max-plan-rounds` and `--max-rounds` add another bounded batch
   from the saved next round. Explicitly passed role/model/effort flags
   override the checkpoint and are echoed as `resume override:` trace lines.
+  Resume preserves saved verbose mode; pass `--no-verbose` to disable it.
 - Approval tokens must be an exact line at the end of the reviewer output;
   prose that merely mentions a token does not approve.
 - Each agent turn times out after `A2A_AGENT_TIMEOUT_SECONDS` (default 3600;

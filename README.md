@@ -277,6 +277,18 @@ If a run exits early, resume it from the same target repo:
 a2a-loop --resume <run-id>
 ```
 
+To resume the newest run under `.a2a/runs/`, omit the run id:
+
+```bash
+a2a-loop --resume
+```
+
+That picks the same newest checkpoint you would find with:
+
+```bash
+ls -td .a2a/runs/* | head
+```
+
 You can also pass the state file path directly. On resume, the coordinator
 checks out the saved branch, appends to the original log, reuses the saved plan
 and role settings, and continues from the next incomplete phase. If the earlier
@@ -285,10 +297,11 @@ another bounded batch of rounds instead of restarting at `review-1.md`.
 
 Explicitly passed flags override the checkpoint on resume: `--planner`,
 `--implementer`, `--reviewer`, `--codex-model`, `--codex-effort`,
-`--claude-model`, `--claude-effort`, and `--claude-use-api-key`. Each applied
-override is printed as a `resume override:` trace line. Defaults resolved from
-config files do not override the checkpoint, so a plain `--resume` keeps the
-run's original settings.
+`--claude-model`, `--claude-effort`, `--claude-use-api-key`, `--verbose`, and
+`--no-verbose`. Each applied override is printed as a `resume override:` trace
+line. Defaults resolved from config files do not override the checkpoint, so a
+plain `--resume` keeps the run's original settings. If a saved run has
+`verbose=true`, use `--no-verbose` to resume quietly.
 
 ## Safety
 
@@ -309,13 +322,15 @@ run's original settings.
 - The terminal shows defaults, artifact paths, agent steps, handoffs, approval,
   PR, and merge actions.
 - Pass `--verbose` or set `A2A_VERBOSE=1` for a summarized live trace: public
-  agent text, tool calls/results, stderr, and a post-turn worktree diffstat.
-  Raw command output still goes to the run log.
+  non-code agent text, tool calls, stderr, and a post-turn worktree diffstat.
+  Code snippets and raw tool output stay in the run log instead of the terminal.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the run
   ledger, and coordinator-persisted plan updates sync back to the source plan.
 - Logs are written to `.a2a/logs/<timestamp>/run.log` with the same status
   breadcrumbs plus raw commands and agent output. Agent stdout streams into
   the log as it arrives, so `tail -f` shows long turns live.
+- Decision logs are written to `.a2a/runs/<run-id>/decisions.md` with concise
+  reviewer reasons, implementer responses, resolutions, and commit hashes.
 - Local review stdout is persisted to `.a2a/reviews/<run-id>/review-N.md`;
   reviewers are not required to write review files directly.
 - Plan stdout and optional `A2A_PLAN_UPDATE` blocks are coordinator-persisted;

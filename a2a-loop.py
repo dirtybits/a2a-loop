@@ -43,6 +43,7 @@ PLAN_UPDATE_BEGIN = "A2A_PLAN_UPDATE_BEGIN"
 PLAN_UPDATE_END = "A2A_PLAN_UPDATE_END"
 COMMIT_MESSAGE_BEGIN = "A2A_COMMIT_MESSAGE_BEGIN"
 COMMIT_MESSAGE_END = "A2A_COMMIT_MESSAGE_END"
+LATEST_RESUME = "__latest__"
 AGENTS = ("claude", "codex")
 STATE_VERSION = 1
 CODEX_EFFORTS = ("minimal", "low", "medium", "high")
@@ -361,6 +362,7 @@ class RunState:
     claude_model_source: str
     claude_effort_source: str
     log_path: str
+    decision_log_path: str
     claude_use_api_key: bool = False
     phase: str = "initialized"
     plan_review_round: int = 1
@@ -375,7 +377,24 @@ def state_path(repo: pathlib.Path, run_id: str) -> pathlib.Path:
     return repo / ".a2a" / "runs" / run_id / "state.json"
 
 
+def decision_log_path(repo: pathlib.Path, run_id: str) -> pathlib.Path:
+    return repo / ".a2a" / "runs" / run_id / "decisions.md"
+
+
+def latest_state_path(repo: pathlib.Path) -> pathlib.Path:
+    runs_dir = repo / ".a2a" / "runs"
+    if not runs_dir.exists():
+        raise SystemExit(f"No runs directory exists yet: {runs_dir}")
+    candidates = [path / "state.json" for path in runs_dir.iterdir() if path.is_dir()]
+    candidates = [path for path in candidates if path.exists()]
+    if not candidates:
+        raise SystemExit(f"No resume checkpoints found under: {runs_dir}")
+    return max(candidates, key=lambda path: path.parent.stat().st_mtime)
+
+
 def resolve_state_path(repo: pathlib.Path, value: str) -> pathlib.Path:
+    if value == LATEST_RESUME:
+        return latest_state_path(repo)
     candidate = pathlib.Path(value).expanduser()
     if candidate.is_dir():
         return candidate / "state.json"
@@ -413,7 +432,68 @@ def load_state(path: pathlib.Path) -> RunState:
     data.setdefault("claude_model_source", "legacy checkpoint")
     data.setdefault("claude_effort_source", "legacy checkpoint")
     data.setdefault("verbose", False)
+    repo = pathlib.Path(data.get("repo") or path.parents[3]).expanduser()
+    data.setdefault("decision_log_path", str(decision_log_path(repo, data["run_id"]).relative_to(repo)))
     return RunState(**data)
+
+
+def summarize_agent_output(output: str, max_len: int = 220) -> str:
+    skip_tokens = {
+        APPROVAL_TOKEN,
+        PLAN_READY_TOKEN,
+        PLAN_REVIEW_READY_TOKEN,
+        PLAN_APPROVAL_TOKEN,
+        PLAN_CHANGES_TOKEN,
+        REVIEW_CHANGES_TOKEN,
+        "IMPLEMENTATION_READY",
+    }
+    for raw_line in output.splitlines():
+        line = compact_line(raw_line, max_len)
+        if not line or line in skip_tokens:
+            continue
+        if line in {PLAN_UPDATE_BEGIN, PLAN_UPDATE_END, COMMIT_MESSAGE_BEGIN, COMMIT_MESSAGE_END}:
+            continue
+        if is_code_like_verbose_line(line):
+            continue
+        return line
+    return "No short reason captured; see run log for full output."
+
+
+def append_decision(
+    repo: pathlib.Path,
+    state: RunState,
+    dry_run: bool,
+    trace: WorkflowTrace,
+    title: str,
+    fields: list[tuple[str, str | None]],
+) -> None:
+    path = resolve_repo_path(repo, pathlib.Path(state.decision_log_path))
+    lines = [f"## {title}", ""]
+    for key, value in fields:
+        if value:
+            lines.append(f"- {key}: {value}")
+    lines.append("")
+    if dry_run:
+        trace.event(f"dry-run would append decision log: {repo_relative(repo, path)}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        header = textwrap.dedent(
+            f"""\
+            # A2A Decision Log
+
+            - Run: {state.run_id}
+            - Goal: {state.goal}
+            - Branch: {state.branch}
+            - Base: {state.base}
+
+            """
+        )
+        path.write_text(header, encoding="utf-8")
+    with path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+        f.write("\n")
+    trace.event(f"decision log appended: {repo_relative(repo, path)}")
 
 
 def run(
@@ -547,13 +627,56 @@ def verbose_emit(agent: str, message: str) -> None:
         print(f"[{agent}] {line}")
 
 
+def is_code_like_verbose_line(line: str) -> bool:
+    stripped = strip_ansi(line).strip()
+    if not stripped:
+        return True
+    code_prefixes = (
+        "```",
+        "@@",
+        "diff --git",
+        "index ",
+        "--- ",
+        "+++ ",
+        "+",
+        "-",
+        "import ",
+        "from ",
+        "export ",
+        "const ",
+        "let ",
+        "var ",
+        "function ",
+        "class ",
+        "def ",
+        "return ",
+    )
+    if stripped.startswith(code_prefixes):
+        return True
+    if re.match(r"^\d+\s*[|:]\s*", stripped):
+        return True
+    if re.match(r"^[}\])];,]+$", stripped):
+        return True
+    if re.search(r"[{}();=<>]", stripped) and len(stripped.split()) <= 12:
+        return True
+    return False
+
+
 def make_text_verbose_handler(agent: str) -> Callable[[str], None]:
     noise = (
         "WARNING: proceeding, even though",
         "Run Codex non-interactively",
     )
+    in_code_block = False
 
     def handle(line: str) -> None:
+        nonlocal in_code_block
+        raw = strip_ansi(line).strip()
+        if raw.startswith("```"):
+            in_code_block = not in_code_block
+            return
+        if in_code_block or is_code_like_verbose_line(raw):
+            return
         clean = compact_line(line)
         if not clean or any(clean.startswith(prefix) for prefix in noise):
             return
@@ -565,14 +688,13 @@ def make_text_verbose_handler(agent: str) -> Callable[[str], None]:
 def summarize_tool_input(tool_name: str, tool_input: object) -> str:
     if not isinstance(tool_input, dict):
         return ""
+    path = tool_input.get("file_path") or tool_input.get("path")
+    if isinstance(path, str) and path.strip():
+        return f": {path}"
     for key in ("command", "cmd", "pattern", "query", "file_path", "path"):
         value = tool_input.get(key)
         if isinstance(value, str) and value.strip():
             return f": {compact_line(value, 180)}"
-    if tool_name.lower() in {"edit", "write", "multiedit"}:
-        path = tool_input.get("file_path") or tool_input.get("path")
-        if isinstance(path, str) and path.strip():
-            return f": {path}"
     return ""
 
 
@@ -595,7 +717,10 @@ def summarize_tool_result(content: object) -> str | None:
 
 
 def make_claude_verbose_handler(agent: str) -> Callable[[str], None]:
+    in_code_block = False
+
     def handle(line: str) -> None:
+        nonlocal in_code_block
         if not line.strip():
             return
         try:
@@ -624,6 +749,12 @@ def make_claude_verbose_handler(agent: str) -> Callable[[str], None]:
                 item_type = item.get("type")
                 if item_type == "text" and isinstance(item.get("text"), str):
                     for text_line in item["text"].splitlines():
+                        raw = strip_ansi(text_line).strip()
+                        if raw.startswith("```"):
+                            in_code_block = not in_code_block
+                            continue
+                        if in_code_block or is_code_like_verbose_line(raw):
+                            continue
                         verbose_emit(agent, text_line)
                 elif item_type == "tool_use":
                     name = str(item.get("name") or "tool")
@@ -637,9 +768,7 @@ def make_claude_verbose_handler(agent: str) -> Callable[[str], None]:
             for item in content:
                 if not isinstance(item, dict) or item.get("type") != "tool_result":
                     continue
-                summary = summarize_tool_result(item.get("content"))
-                if summary:
-                    verbose_emit(agent, f"tool result: {summary}")
+                verbose_emit(agent, "tool result received")
             return
         if event_type == "result":
             subtype = event.get("subtype") or event.get("status") or "done"
@@ -925,6 +1054,7 @@ def trace_run_defaults(repo: pathlib.Path, plan_path: pathlib.Path, state: RunSt
         "artifacts: "
         f"plan={display_path(repo, plan_path)}, "
         f"state={display_path(repo, state_path(repo, state.run_id))}, "
+        f"decisions={display_path(repo, resolve_repo_path(repo, pathlib.Path(state.decision_log_path)))}, "
         f"log={display_path(repo, pathlib.Path(state.log_path))}"
     )
     if state.source_plan_path and state.source_plan_path != state.plan_path:
@@ -1230,27 +1360,30 @@ def commit_if_changed(
     dry_run: bool,
     log: pathlib.Path,
     trace: WorkflowTrace,
-) -> bool:
+) -> str | None:
     if dry_run:
         trace.event(f"dry-run would create coordinator commit: {message}")
-        return True
+        return "DRY_RUN_COMMIT"
     status = run(["git", "status", "--porcelain"], cwd=repo, dry_run=dry_run, log_file=log)
     require_ok(status, "working tree status")
     if not status.stdout.strip():
         trace.event(f"no changes to commit after: {message}")
-        return False
+        return None
     add_result = run(["git", "add", "-A"], cwd=repo, dry_run=dry_run, log_file=log)
     require_ok(add_result, "stage coordinator commit")
     diff_result = run(["git", "diff", "--cached", "--quiet"], cwd=repo, dry_run=dry_run, log_file=log)
     if diff_result.returncode == 0:
         trace.event(f"no staged changes to commit after: {message}")
-        return False
+        return None
     if diff_result.returncode != 1:
         require_ok(diff_result, "staged diff check")
     commit_result = run(["git", "commit", "-m", message], cwd=repo, dry_run=dry_run, log_file=log)
     require_ok(commit_result, "coordinator commit")
-    trace.event(f"coordinator commit created: {message}")
-    return True
+    rev_result = run(["git", "rev-parse", "--short", "HEAD"], cwd=repo, dry_run=dry_run, log_file=log)
+    require_ok(rev_result, "coordinator commit rev")
+    commit_hash = rev_result.stdout.strip()
+    trace.event(f"coordinator commit created: {commit_hash} {message}")
+    return commit_hash
 
 
 def short_commit_goal(goal: str) -> str:
@@ -1586,10 +1719,35 @@ def negotiate_plan(
         if dry_run:
             approval = PLAN_APPROVAL_TOKEN
         if ends_with_token(approval, PLAN_APPROVAL_TOKEN):
+            append_decision(
+                repo,
+                state,
+                dry_run,
+                trace,
+                f"Plan round {round_index}: approved",
+                [
+                    ("Reviewer", state.reviewer),
+                    ("Reason", summarize_agent_output(approval)),
+                    ("Plan", plan_rel),
+                ],
+            )
             state.phase = "plan_ready"
             save_state(repo, state, dry_run, trace)
             return read_if_present(plan_path, "DRY_RUN_PLAN")
         if ends_with_token(approval, PLAN_CHANGES_TOKEN):
+            append_decision(
+                repo,
+                state,
+                dry_run,
+                trace,
+                f"Plan round {round_index}: changes requested",
+                [
+                    ("Reviewer", state.reviewer),
+                    ("Reason", summarize_agent_output(approval)),
+                    ("Implementer", state.implementer),
+                    ("Plan", plan_rel),
+                ],
+            )
             persist_plan_markdown(
                 plan_path,
                 approval,
@@ -1642,10 +1800,36 @@ def run_local_review_loop(
             review = APPROVAL_TOKEN
         if ends_with_token(review, APPROVAL_TOKEN):
             trace.event(f"review approved by {state.reviewer}")
+            append_decision(
+                repo,
+                state,
+                dry_run,
+                trace,
+                f"Local review round {round_index}: approved",
+                [
+                    ("Reviewer", state.reviewer),
+                    ("Reason", summarize_agent_output(review)),
+                    ("Review", review_rel),
+                ],
+            )
             state.phase = "approved"
             state.approved = True
             save_state(repo, state, dry_run, trace)
             return True
+
+        append_decision(
+            repo,
+            state,
+            dry_run,
+            trace,
+            f"Local review round {round_index}: changes requested",
+            [
+                ("Reviewer", state.reviewer),
+                ("Reason", summarize_agent_output(review)),
+                ("Review", review_rel),
+                ("Next", f"{state.implementer} fixes local diff"),
+            ],
+        )
 
         fix_output = run_agent(
             state.implementer,
@@ -1660,7 +1844,7 @@ def run_local_review_loop(
         )
         persist_plan_update_block(plan_path, fix_output, dry_run, trace, f"local fix round {round_index} stdout")
         sync_source_plan(repo, plan_path, state, dry_run, trace)
-        commit_if_changed(
+        commit_hash = commit_if_changed(
             repo,
             commit_message_from_output(
                 fix_output,
@@ -1669,6 +1853,18 @@ def run_local_review_loop(
             dry_run,
             log,
             trace,
+        )
+        append_decision(
+            repo,
+            state,
+            dry_run,
+            trace,
+            f"Local fix round {round_index}: implemented",
+            [
+                ("Implementer", state.implementer),
+                ("Response", summarize_agent_output(fix_output)),
+                ("Commit", commit_hash),
+            ],
         )
         state.phase = "implementation_ready"
         state.local_review_round = round_index + 1
@@ -1701,10 +1897,35 @@ def run_gh_review_loop(
             review = APPROVAL_TOKEN
         if ends_with_token(review, APPROVAL_TOKEN):
             trace.event(f"GitHub review approved by {state.reviewer}")
+            append_decision(
+                repo,
+                state,
+                dry_run,
+                trace,
+                f"GitHub review round {round_index}: approved",
+                [
+                    ("Reviewer", state.reviewer),
+                    ("Reason", summarize_agent_output(review)),
+                    ("PR", state.pr_url),
+                ],
+            )
             state.phase = "approved"
             state.approved = True
             save_state(repo, state, dry_run, trace)
             return True
+        append_decision(
+            repo,
+            state,
+            dry_run,
+            trace,
+            f"GitHub review round {round_index}: changes requested",
+            [
+                ("Reviewer", state.reviewer),
+                ("Reason", summarize_agent_output(review)),
+                ("PR", state.pr_url),
+                ("Next", f"{state.implementer} fixes PR comments"),
+            ],
+        )
         fix_output = run_agent(
             state.implementer,
             "fix GitHub review comments",
@@ -1719,7 +1940,7 @@ def run_gh_review_loop(
         plan_path = resolve_repo_path(repo, pathlib.Path(state.plan_path))
         persist_plan_update_block(plan_path, fix_output, dry_run, trace, f"GitHub fix round {round_index} stdout")
         sync_source_plan(repo, plan_path, state, dry_run, trace)
-        committed = commit_if_changed(
+        commit_hash = commit_if_changed(
             repo,
             commit_message_from_output(
                 fix_output,
@@ -1729,7 +1950,19 @@ def run_gh_review_loop(
             log,
             trace,
         )
-        if committed:
+        append_decision(
+            repo,
+            state,
+            dry_run,
+            trace,
+            f"GitHub fix round {round_index}: implemented",
+            [
+                ("Implementer", state.implementer),
+                ("Response", summarize_agent_output(fix_output)),
+                ("Commit", commit_hash),
+            ],
+        )
+        if commit_hash:
             push_result = run(["git", "push"], cwd=repo, dry_run=dry_run, log_file=log)
             require_ok(push_result, "push coordinator fixes")
         gh_text(
@@ -1767,7 +2000,15 @@ def main() -> int:
     )
     parser.add_argument("--goal", help="Goal to plan and implement. Optional when --plan is passed.")
     parser.add_argument("--plan", type=pathlib.Path, help="Use an existing .plan.md file instead of creating one.")
-    parser.add_argument("--resume", help="Resume a checkpoint from .a2a/runs/<id>/state.json, or pass a state path.")
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const=LATEST_RESUME,
+        help=(
+            "Resume a checkpoint from .a2a/runs/<id>/state.json, or pass a state path. "
+            "With no value, resumes the newest .a2a/runs/* checkpoint."
+        ),
+    )
     parser.add_argument("--base", default="main", help="Base branch for diff review and PR creation.")
     parser.add_argument("--branch", help="Branch to create/use. Defaults to a timestamped a2a/* branch.")
     parser.add_argument("--max-plan-rounds", type=int, default=2, help="Maximum plan negotiation rounds.")
@@ -1803,7 +2044,12 @@ def main() -> int:
         "--verbose",
         action="store_true",
         default=default_verbose,
-        help="Mirror agent stdout/stderr to the terminal as each turn runs. Can also be set with A2A_VERBOSE=1.",
+        help="Show summarized live agent text, tool events, stderr, and post-turn diffstats. Can also be set with A2A_VERBOSE=1.",
+    )
+    parser.add_argument(
+        "--no-verbose",
+        action="store_true",
+        help="Disable verbose output on resume, even if the checkpoint or A2A_VERBOSE enabled it.",
     )
     parser.add_argument("--merge", action="store_true", help="Squash merge after reviewer approval.")
     parser.add_argument(
@@ -1852,7 +2098,7 @@ def main() -> int:
     if not initial_repo.exists():
         raise SystemExit(f"Repo does not exist: {initial_repo}")
 
-    if args.resume:
+    if args.resume is not None:
         loaded_path = resolve_state_path(initial_repo, args.resume).resolve()
         state = load_state(loaded_path)
         repo = pathlib.Path(state.repo).expanduser().resolve()
@@ -1908,12 +2154,19 @@ def main() -> int:
         if arg_was_passed("--claude-use-api-key"):
             state.claude_use_api_key = True
             overrides.append("claude-use-api-key=true")
-        if arg_was_passed("--verbose") or default_verbose:
+        if args.no_verbose:
+            state.verbose = False
+            overrides.append("verbose=false")
+        elif arg_was_passed("--verbose") or default_verbose:
             state.verbose = True
             overrides.append("verbose=true")
         plan_path = resolve_repo_path(repo, pathlib.Path(state.plan_path))
         create_plan = False
         trace.event(f"resuming run {state.run_id} from {repo_relative(repo, loaded_path)}")
+        if state.verbose and not any(
+            [arg_was_passed("--verbose"), arg_was_passed("--no-verbose"), default_verbose]
+        ):
+            trace.event("resume setting: verbose=true from checkpoint; pass --no-verbose to disable")
         for override in overrides:
             trace.event(f"resume override: {override}")
     else:
@@ -1977,6 +2230,7 @@ def main() -> int:
             claude_use_api_key=args.claude_use_api_key,
             verbose=args.verbose,
             log_path=str(log),
+            decision_log_path=repo_relative(repo, decision_log_path(repo, stamp)),
         )
 
     ensure_a2a_dirs(repo, args.dry_run)
@@ -1993,7 +2247,7 @@ def main() -> int:
     else:
         trace.event(f"Claude auth status: {claude_auth_status(repo, args.dry_run, log)}")
     trace_run_defaults(repo, plan_path, state, trace)
-    if args.resume:
+    if args.resume is not None:
         trace.event(f"branch checkout: {state.branch}")
         checkout_branch(repo, state.branch, args.dry_run, log)
     else:
@@ -2026,7 +2280,7 @@ def main() -> int:
         )
         persist_plan_update_block(plan_path, implement_output, args.dry_run, trace, "implementation stdout")
         sync_source_plan(repo, plan_path, state, args.dry_run, trace)
-        commit_if_changed(
+        commit_hash = commit_if_changed(
             repo,
             commit_message_from_output(
                 implement_output,
@@ -2035,6 +2289,18 @@ def main() -> int:
             args.dry_run,
             log,
             trace,
+        )
+        append_decision(
+            repo,
+            state,
+            args.dry_run,
+            trace,
+            "Implementation: completed",
+            [
+                ("Implementer", state.implementer),
+                ("Response", summarize_agent_output(implement_output)),
+                ("Commit", commit_hash),
+            ],
         )
         state.phase = "implementation_ready"
         save_state(repo, state, args.dry_run, trace)
@@ -2053,13 +2319,22 @@ def main() -> int:
     if state.gh_review:
         if not state.pr_url:
             trace.event(f"opening or updating PR before GitHub review: base {state.base}, branch {state.branch}")
-            commit_if_changed(
+            commit_hash = commit_if_changed(
                 repo,
                 f"A2A final changes: {short_commit_goal(state.goal)}",
                 args.dry_run,
                 log,
                 trace,
             )
+            if commit_hash:
+                append_decision(
+                    repo,
+                    state,
+                    args.dry_run,
+                    trace,
+                    "Final changes: committed before GitHub review",
+                    [("Commit", commit_hash)],
+                )
             state.pr_url = open_or_update_pr(repo, state.base, state.branch, state.goal, plan, args.dry_run, log)
             state.phase = "pr_ready"
             save_state(repo, state, args.dry_run, trace)
@@ -2082,13 +2357,22 @@ def main() -> int:
         if approved:
             if not state.pr_url:
                 trace.event(f"opening or updating PR after local approval: base {state.base}, branch {state.branch}")
-                commit_if_changed(
+                commit_hash = commit_if_changed(
                     repo,
                     f"A2A final changes: {short_commit_goal(state.goal)}",
                     args.dry_run,
                     log,
                     trace,
                 )
+                if commit_hash:
+                    append_decision(
+                        repo,
+                        state,
+                        args.dry_run,
+                        trace,
+                        "Final changes: committed before PR",
+                        [("Commit", commit_hash)],
+                    )
                 state.pr_url = open_or_update_pr(repo, state.base, state.branch, state.goal, plan, args.dry_run, log)
                 save_state(repo, state, args.dry_run, trace)
 
