@@ -70,11 +70,12 @@ a2a-loop \
   --dry-run
 ```
 
-## Install as a Codex Skill
+## Install as an Agent Skill
 
 This repo also includes a thin companion skill at `skills/a2a-loop/`. The skill
-does not replace the wrapper; it teaches Codex when and how to use the wrapper
-without reloading the full project context.
+does not replace the wrapper; it gives both Codex and Claude shared procedural
+guidance for when and how to use the wrapper without reloading the full project
+context.
 
 Install it by symlinking the repo-local skill into your shared skills root:
 
@@ -83,8 +84,9 @@ mkdir -p ~/.agents/skills
 ln -s ~/src/a2a-loop/skills/a2a-loop ~/.agents/skills/a2a-loop
 ```
 
-After that, future Codex sessions can invoke `$a2a-loop` as procedural guidance
-for running local-first Codex <-> Claude review loops.
+After that, future agent sessions can invoke `$a2a-loop` as procedural guidance
+for running local-first Codex <-> Claude review loops. Codex and Claude can both
+use the same skill text when they need to understand the coordinator workflow.
 
 ## How It Works
 
@@ -306,8 +308,9 @@ run's original settings.
   merely quotes a token is not an approval.
 - The terminal shows defaults, artifact paths, agent steps, handoffs, approval,
   PR, and merge actions.
-- Pass `--verbose` or set `A2A_VERBOSE=1` to mirror agent stdout/stderr to the
-  terminal during each turn.
+- Pass `--verbose` or set `A2A_VERBOSE=1` for a summarized live trace: public
+  agent text, tool calls/results, stderr, and a post-turn worktree diffstat.
+  Raw command output still goes to the run log.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the run
   ledger, and coordinator-persisted plan updates sync back to the source plan.
 - Logs are written to `.a2a/logs/<timestamp>/run.log` with the same status

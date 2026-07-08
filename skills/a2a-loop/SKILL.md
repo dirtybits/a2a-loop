@@ -104,8 +104,9 @@ auth status:` from `claude auth status --json` at startup when applicable.
 - Do not merge unless the exact `MERGE_DECISION: APPROVE` token appears.
 - Watch the terminal for defaults, artifact paths, agent step, handoff,
   approval, PR, and merge status.
-- Use `--verbose` or `A2A_VERBOSE=1` when the operator wants live agent
-  stdout/stderr mirrored to the terminal.
+- Use `--verbose` or `A2A_VERBOSE=1` when the operator wants a summarized live
+  trace of public agent text, tool calls/results, stderr, and post-turn
+  diffstats. Raw command output still goes to the run log.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the run
   ledger, and coordinator-persisted plan updates sync back to the source plan.
 - Inspect `.a2a/logs/<timestamp>/run.log`, `.a2a/plans/`, and `.a2a/reviews/`

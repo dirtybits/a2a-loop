@@ -21,6 +21,7 @@ import sys
 import textwrap
 import threading
 from dataclasses import asdict, dataclass
+from typing import Callable
 
 try:
     import tomllib
@@ -70,6 +71,7 @@ DEFAULT_AGENT_TIMEOUT_SECONDS = 3600
 # Fatal CLI errors surface on stderr or near the end of the transcript;
 # scanning full stdout false-positives on diffs that merely quote them.
 FATAL_SCAN_STDOUT_TAIL_LINES = 40
+VERBOSE_LINE_LIMIT = 240
 
 
 def warn(message: str) -> None:
@@ -423,6 +425,7 @@ def run(
     timeout: int | None = None,
     stream_output: bool = False,
     stream_label: str | None = None,
+    stdout_line_handler: Callable[[str], None] | None = None,
 ) -> CmdResult:
     rendered = " ".join(shlex.quote(a) for a in args)
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -458,7 +461,10 @@ def run(
                 f.write(line)
                 f.flush()
                 if stream_output:
-                    print(f"{stdout_prefix}{line}", end="")
+                    if stdout_line_handler:
+                        stdout_line_handler(line.rstrip("\n"))
+                    else:
+                        print(f"{stdout_prefix}{line}", end="")
 
     def pump_stderr() -> None:
         assert proc.stderr is not None
@@ -524,6 +530,179 @@ def require_no_agent_error(result: CmdResult, context: str) -> None:
             raise SystemExit(format_command_failure(context, result, f"fatal agent output: {pattern}"))
 
 
+def strip_ansi(value: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", value)
+
+
+def compact_line(value: str, limit: int = VERBOSE_LINE_LIMIT) -> str:
+    line = re.sub(r"\s+", " ", strip_ansi(value)).strip()
+    if len(line) <= limit:
+        return line
+    return line[: limit - 3].rstrip() + "..."
+
+
+def verbose_emit(agent: str, message: str) -> None:
+    line = compact_line(message)
+    if line:
+        print(f"[{agent}] {line}")
+
+
+def make_text_verbose_handler(agent: str) -> Callable[[str], None]:
+    noise = (
+        "WARNING: proceeding, even though",
+        "Run Codex non-interactively",
+    )
+
+    def handle(line: str) -> None:
+        clean = compact_line(line)
+        if not clean or any(clean.startswith(prefix) for prefix in noise):
+            return
+        verbose_emit(agent, clean)
+
+    return handle
+
+
+def summarize_tool_input(tool_name: str, tool_input: object) -> str:
+    if not isinstance(tool_input, dict):
+        return ""
+    for key in ("command", "cmd", "pattern", "query", "file_path", "path"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return f": {compact_line(value, 180)}"
+    if tool_name.lower() in {"edit", "write", "multiedit"}:
+        path = tool_input.get("file_path") or tool_input.get("path")
+        if isinstance(path, str) and path.strip():
+            return f": {path}"
+    return ""
+
+
+def summarize_tool_result(content: object) -> str | None:
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item, str):
+                parts.append(item)
+        content = "\n".join(parts)
+    if not isinstance(content, str):
+        return None
+    lines = [compact_line(line, 180) for line in content.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return None
+    return lines[0]
+
+
+def make_claude_verbose_handler(agent: str) -> Callable[[str], None]:
+    def handle(line: str) -> None:
+        if not line.strip():
+            return
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            verbose_emit(agent, line)
+            return
+        event_type = event.get("type")
+        if event_type == "system":
+            subtype = event.get("subtype")
+            tools = event.get("tools")
+            if subtype == "init":
+                if isinstance(tools, list) and tools:
+                    verbose_emit(agent, "session started; tools: " + ", ".join(str(tool) for tool in tools[:8]))
+                else:
+                    verbose_emit(agent, "session started")
+            return
+        if event_type == "assistant":
+            message = event.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                return
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "text" and isinstance(item.get("text"), str):
+                    for text_line in item["text"].splitlines():
+                        verbose_emit(agent, text_line)
+                elif item_type == "tool_use":
+                    name = str(item.get("name") or "tool")
+                    verbose_emit(agent, f"tool: {name}{summarize_tool_input(name, item.get('input'))}")
+            return
+        if event_type == "user":
+            message = event.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                return
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "tool_result":
+                    continue
+                summary = summarize_tool_result(item.get("content"))
+                if summary:
+                    verbose_emit(agent, f"tool result: {summary}")
+            return
+        if event_type == "result":
+            subtype = event.get("subtype") or event.get("status") or "done"
+            verbose_emit(agent, f"turn {subtype}")
+
+    return handle
+
+
+def parse_claude_stream_json_output(stdout: str) -> str:
+    result_text = ""
+    assistant_text: list[str] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "result" and isinstance(event.get("result"), str):
+            result_text = event["result"]
+            continue
+        if event.get("type") != "assistant":
+            continue
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                assistant_text.append(item["text"])
+    if result_text:
+        return result_text
+    return "\n".join(assistant_text)
+
+
+def emit_verbose_worktree_summary(agent: str, repo: pathlib.Path, dry_run: bool, log: pathlib.Path) -> None:
+    if dry_run:
+        return
+    diff = run(["git", "diff", "--stat"], cwd=repo, dry_run=dry_run, log_file=log)
+    if diff.returncode != 0:
+        return
+    status = run(["git", "status", "--short"], cwd=repo, dry_run=dry_run, log_file=log)
+    if status.returncode != 0:
+        return
+    diff_lines = [compact_line(line) for line in diff.stdout.splitlines() if line.strip()]
+    untracked = [
+        compact_line(line[3:])
+        for line in status.stdout.splitlines()
+        if line.startswith("?? ") and line[3:].strip()
+    ]
+    if not diff_lines and not untracked:
+        verbose_emit(agent, "worktree changes: none")
+        return
+    verbose_emit(agent, "worktree changes:")
+    for line in diff_lines[:20]:
+        verbose_emit(agent, f"  {line}")
+    for path in untracked[:20]:
+        verbose_emit(agent, f"  untracked: {path}")
+    omitted = max(0, len(diff_lines) + len(untracked) - 40)
+    if omitted:
+        verbose_emit(agent, f"  ... {omitted} more entries")
+
+
 def claude_env(use_api_key: bool) -> dict[str, str] | None:
     if use_api_key:
         return None
@@ -549,8 +728,10 @@ def claude_print(
         "--permission-mode",
         "dontAsk",
         "--output-format",
-        "text",
+        "stream-json" if verbose else "text",
     ]
+    if verbose:
+        args.append("--verbose")
     if model:
         args.extend(["--model", model])
     if effort:
@@ -566,10 +747,15 @@ def claude_print(
         timeout=agent_timeout_seconds(),
         stream_output=verbose,
         stream_label="claude",
+        stdout_line_handler=make_claude_verbose_handler("claude") if verbose else None,
     )
     require_ok(result, "Claude turn")
-    require_no_agent_error(result, "Claude turn")
-    return result.stdout
+    output = parse_claude_stream_json_output(result.stdout) if verbose else result.stdout
+    require_no_agent_error(
+        CmdResult(args=result.args, returncode=result.returncode, stdout=output, stderr=result.stderr),
+        "Claude turn",
+    )
+    return output
 
 
 def codex_exec(
@@ -605,6 +791,7 @@ def codex_exec(
         timeout=agent_timeout_seconds(),
         stream_output=verbose,
         stream_label="codex",
+        stdout_line_handler=make_text_verbose_handler("codex") if verbose else None,
     )
     require_ok(result, "Codex turn")
     require_no_agent_error(result, "Codex turn")
@@ -636,6 +823,8 @@ def run_agent(
             state.claude_use_api_key,
             state.verbose,
         )
+        if state.verbose:
+            emit_verbose_worktree_summary(agent, repo, dry_run, log)
         trace.finish_agent(agent, step, phase, model, effort, output)
         return output
     if agent == "codex":
@@ -643,6 +832,8 @@ def run_agent(
         effort = state.codex_display_effort
         step = trace.start_agent(agent, phase, model, effort, artifact)
         output = codex_exec(prompt, repo, dry_run, log, state.codex_model, state.codex_effort, state.verbose)
+        if state.verbose:
+            emit_verbose_worktree_summary(agent, repo, dry_run, log)
         trace.finish_agent(agent, step, phase, model, effort, output)
         return output
     raise ValueError(f"Unsupported agent: {agent}")
@@ -1791,7 +1982,7 @@ def main() -> int:
     ensure_a2a_dirs(repo, args.dry_run)
     trace.event(f"repo: {repo}")
     if state.verbose:
-        trace.event("verbose output: agent stdout/stderr mirrored to terminal")
+        trace.event("verbose output: summarized agent text, tool events, stderr, and post-turn diffstats")
     trace.event(f"Codex auth status: {codex_auth_status(repo, args.dry_run, log)}")
     trace.event(
         "Claude auth: "
