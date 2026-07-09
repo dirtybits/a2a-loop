@@ -101,7 +101,20 @@ auth status:` from `claude auth status --json` at startup when applicable.
 - Keep legacy `a2a-logs/` ignored for runs created by older coordinator versions.
 - Keep `--max-plan-rounds` and `--max-rounds` bounded.
 - Prefer a clean branch or disposable worktree for target projects.
+- New branches start from `origin/<base>`; agent PRs are never stacked on
+  unmerged work.
+- The plan body is append-only: the coordinator rejects plan updates that
+  delete existing sections, and `SEQUENCING`/`DECISION`/`stop-the-line`/
+  `founder-acked` callouts are echoed into prompts and the PR body as hard
+  constraints.
+- The plan must carry a `## Closeout` section (`Verified:`,
+  `Attempted-blocked (cause):`, `Deferred (tracked in):`, `Not claimed:`)
+  before the coordinator opens a PR; the reviewer verifies statuses match
+  reality and writes a reviewer briefing that lands in the PR body.
 - Do not merge unless the exact `MERGE_DECISION: APPROVE` token appears.
+- Prefer merging manually or from a separate session. `--merge` refuses
+  same-agent implementer/reviewer runs (self-merge guard) and blocks while
+  `gh pr checks` reports failing or pending checks on the head SHA.
 - Watch the terminal for defaults, artifact paths, agent step, handoff,
   approval, PR, and merge status.
 - Use `--verbose` or `A2A_VERBOSE=1` when the operator wants a summarized live

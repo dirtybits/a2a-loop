@@ -121,6 +121,29 @@ If `--plan path/to/existing.plan.md` is passed, the coordinator skips initial
 plan creation and uses that file in place. It still runs implementer plan review
 and reviewer plan approval unless `--skip-plan-review` is passed.
 
+## Plan Contract
+
+The plan file is the run's contract, and the coordinator enforces it
+mechanically:
+
+- **Append-only body.** Agents may update todo statuses and append dated
+  progress, divergence, and closeout notes, but a plan update that deletes an
+  existing heading (Goal, Scope, Rollback, decision notes, ...) is rejected
+  before anything touches the file, and the run stops with instructions.
+- **Constraint markers are a control channel.** Lines carrying `SEQUENCING`,
+  `DECISION`, `stop-the-line`, or `founder-acked` are extracted from the plan,
+  injected into implementer/fixer prompts as hard constraints, and echoed in
+  the PR body under "Constraints acknowledged".
+- **Machine-checkable closeout.** The implementer must maintain a
+  `## Closeout` section with four labels — `Verified:`,
+  `Attempted-blocked (cause):`, `Deferred (tracked in):`, `Not claimed:` —
+  and the coordinator refuses to open a PR without it. Todos may be
+  `completed` only when every done-when item is met; the reviewer is told to
+  treat overclaimed statuses as changes to request.
+- **Reviewer briefing.** On approval, the reviewer writes a briefing for the
+  human or external reviewer (riskiest hunks, invariants, what to try to
+  break, what internal rounds already caught); it is copied into the PR body.
+
 Use `--gh-review` when you explicitly want the older GitHub PR review surface.
 In that mode, the coordinator pushes and opens or updates the PR before review,
 Claude reviews the PR, then Codex fixes locally and the coordinator commits and
@@ -307,14 +330,32 @@ plain `--resume` keeps the run's original settings. If a saved run has
 
 - Run on a clean branch or disposable worktree.
 - Default branches are named `a2a/<plan-or-goal-slug>-<yyyymmdd>`.
+- New branches start from `origin/<base>` (after a fetch), falling back to the
+  local base ref, so agent PRs are never stacked on unmerged work or stale
+  local state. Squash-merge repos punish stacked branches with conflict
+  surgery.
 - Passing `--branch` checks out an existing branch if present, or creates it if
   missing; it does not reset an existing branch.
+- Every run starts with a capability manifest trace: CLI availability, repo
+  writability, origin reachability, and both agents' auth status — so a run
+  never discovers mid-turn that a dependency is missing. The implementer is
+  also told to pre-classify plan verification steps as runnable or blocked up
+  front instead of discovering them mid-run.
 - `.a2a/` is ignored by default because it is local working memory.
 - `.a2a/` and legacy `a2a-logs/` are added to `.gitignore` automatically after
   branch setup, so the change stays isolated to the run branch.
 - Keep `--max-plan-rounds` bounded.
 - Keep `--max-rounds` bounded.
 - Do not pass `--merge` until the dry-run and prompt contract look right.
+  Prefer merging from a separate session or by hand: the loop's job ends at an
+  open, well-briefed PR.
+- `--merge` refuses to run when the implementer and reviewer are the same
+  agent (self-merge guard): the author of a change must not be its only merge
+  gate.
+- Before an auto-merge, the coordinator runs `gh pr checks` and blocks the
+  merge while checks are failing or pending on the head SHA — a green
+  deployment preview alone is never treated as CI evidence. Re-trigger
+  skipped workflows by closing and reopening the PR.
 - The coordinator fails closed unless Claude emits `MERGE_DECISION: APPROVE`.
 - Approval tokens must appear as an exact line at the end of the reviewer's
   output (a small trailing window tolerates CLI footers); reviewer prose that

@@ -16,6 +16,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -72,6 +73,24 @@ DEFAULT_AGENT_TIMEOUT_SECONDS = 3600
 # Fatal CLI errors surface on stderr or near the end of the transcript;
 # scanning full stdout false-positives on diffs that merely quote them.
 FATAL_SCAN_STDOUT_TAIL_LINES = 40
+# Plan notes carrying these markers are a control channel from the human to
+# the agents: echoed into prompts and the PR body, protected by the
+# append-only plan rule.
+CONSTRAINT_MARKERS = ("SEQUENCING", "DECISION", "stop-the-line", "founder-acked")
+# The closeout section of the plan must carry all four labels before the
+# coordinator will open a PR; this keeps verification claims honest.
+CLOSEOUT_REQUIRED_LABELS = (
+    "Verified:",
+    "Attempted-blocked",
+    "Deferred",
+    "Not claimed:",
+)
+CONVENTION_FILES = (
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    ".github/copilot-instructions.md",
+)
 VERBOSE_LINE_LIMIT = 240
 
 
@@ -371,6 +390,7 @@ class RunState:
     pr_url: str = ""
     approved: bool = False
     verbose: bool = False
+    final_review_path: str = ""
 
 
 def state_path(repo: pathlib.Path, run_id: str) -> pathlib.Path:
@@ -432,6 +452,7 @@ def load_state(path: pathlib.Path) -> RunState:
     data.setdefault("claude_model_source", "legacy checkpoint")
     data.setdefault("claude_effort_source", "legacy checkpoint")
     data.setdefault("verbose", False)
+    data.setdefault("final_review_path", "")
     repo = pathlib.Path(data.get("repo") or path.parents[3]).expanduser()
     data.setdefault("decision_log_path", str(decision_log_path(repo, data["run_id"]).relative_to(repo)))
     return RunState(**data)
@@ -506,6 +527,7 @@ def run(
     stream_output: bool = False,
     stream_label: str | None = None,
     stdout_line_handler: Callable[[str], None] | None = None,
+    stderr_line_handler: Callable[[str], None] | None = None,
 ) -> CmdResult:
     rendered = " ".join(shlex.quote(a) for a in args)
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -551,7 +573,10 @@ def run(
         for line in proc.stderr:
             stderr_lines.append(line)
             if stream_output:
-                print(f"{stderr_prefix}{line}", end="", file=sys.stderr)
+                if stderr_line_handler:
+                    stderr_line_handler(line.rstrip("\n"))
+                else:
+                    print(f"{stderr_prefix}{line}", end="", file=sys.stderr)
 
     pumps = [
         threading.Thread(target=pump_stdout, daemon=True),
@@ -666,6 +691,7 @@ def make_text_verbose_handler(agent: str) -> Callable[[str], None]:
     noise = (
         "WARNING: proceeding, even though",
         "Run Codex non-interactively",
+        "succeeded in ",
     )
     in_code_block = False
 
@@ -921,6 +947,7 @@ def codex_exec(
         stream_output=verbose,
         stream_label="codex",
         stdout_line_handler=make_text_verbose_handler("codex") if verbose else None,
+        stderr_line_handler=make_text_verbose_handler("codex") if verbose else None,
     )
     require_ok(result, "Codex turn")
     require_no_agent_error(result, "Codex turn")
@@ -994,12 +1021,62 @@ def branch_exists(repo: pathlib.Path, branch: str, dry_run: bool, log: pathlib.P
     return result.returncode == 0
 
 
-def ensure_branch(repo: pathlib.Path, branch: str, dry_run: bool, log: pathlib.Path) -> None:
+def ensure_branch(
+    repo: pathlib.Path,
+    branch: str,
+    base: str,
+    dry_run: bool,
+    log: pathlib.Path,
+    trace: WorkflowTrace,
+) -> None:
     if branch_exists(repo, branch, dry_run, log):
         checkout_branch(repo, branch, dry_run, log)
         return
+    # New agent branches always start from the freshest base available so
+    # stacked PRs and stale local state never leak into the reviewed diff
+    # (squash-merge repos turn stacked branches into conflict surgery).
+    fetch = run(["git", "fetch", "origin", base], cwd=repo, dry_run=dry_run, log_file=log)
+    candidates = [f"origin/{base}"] if fetch.returncode == 0 else []
+    candidates.append(base)
+    for start in candidates:
+        result = run(["git", "checkout", "-b", branch, start], cwd=repo, dry_run=dry_run, log_file=log)
+        if result.returncode == 0:
+            trace.event(f"branch {branch} created from {start}")
+            return
+    trace.event(f"base ref {base} unavailable; branching {branch} from current HEAD")
     result = run(["git", "checkout", "-b", branch], cwd=repo, dry_run=dry_run, log_file=log)
     require_ok(result, "branch setup")
+
+
+def trace_capability_manifest(
+    repo: pathlib.Path,
+    dry_run: bool,
+    log: pathlib.Path,
+    trace: WorkflowTrace,
+) -> None:
+    # Probed up front so a run never discovers mid-turn that a tool, scope,
+    # or remote it depends on is missing.
+    clis = ", ".join(
+        f"{name}={'ok' if shutil.which(name) else 'MISSING'}"
+        for name in ("git", "gh", "claude", "codex")
+    )
+    trace.event(f"capabilities: CLIs: {clis}")
+    trace.event(f"capabilities: repo writable: {'yes' if os.access(repo, os.W_OK) else 'NO'}")
+    if dry_run:
+        trace.event("capabilities: origin remote: not probed in dry-run")
+        return
+    try:
+        remote = run(
+            ["git", "ls-remote", "--exit-code", "origin", "HEAD"],
+            cwd=repo,
+            dry_run=False,
+            log_file=log,
+            timeout=30,
+        )
+        reachable = "reachable" if remote.returncode == 0 else "UNREACHABLE"
+    except SystemExit:
+        reachable = "UNREACHABLE (probe timed out)"
+    trace.event(f"capabilities: origin remote: {reachable}")
 
 
 def slugify_goal(goal: str) -> str:
@@ -1155,6 +1232,96 @@ def read_if_present(path: pathlib.Path, fallback: str = "") -> str:
     return path.read_text(encoding="utf-8")
 
 
+def plan_headings(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if re.match(r"^#{1,6}\s", line)]
+
+
+def missing_headings(before: list[str], after: list[str]) -> list[str]:
+    missing: list[str] = []
+    for heading in dict.fromkeys(before):
+        if before.count(heading) > after.count(heading):
+            missing.append(heading)
+    return missing
+
+
+def extract_constraint_lines(text: str) -> list[str]:
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if any(marker in line for marker in CONSTRAINT_MARKERS)
+    ]
+
+
+def extract_closeout(plan_text: str) -> str | None:
+    """Return the plan's Closeout section when it carries all required labels."""
+    lines = plan_text.splitlines()
+    start = None
+    level = 0
+    for index, line in enumerate(lines):
+        match = re.match(r"^(#{1,6})\s+Closeout\b", line, re.IGNORECASE)
+        if match:
+            start = index
+            level = len(match.group(1))
+            break
+    if start is None:
+        return None
+    body: list[str] = []
+    for line in lines[start + 1 :]:
+        match = re.match(r"^(#{1,6})\s", line)
+        if match and len(match.group(1)) <= level:
+            break
+        body.append(line)
+    section = "\n".join(body).strip()
+    if not section:
+        return None
+    if not all(label in section for label in CLOSEOUT_REQUIRED_LABELS):
+        return None
+    return section
+
+
+def conventions_note(repo: pathlib.Path) -> str:
+    found = [name for name in CONVENTION_FILES if (repo / name).exists()]
+    if not found:
+        return ""
+    return (
+        "Repo operating manual: read " + ", ".join(found) + " before your first "
+        "edit and honor its named conventions; it outranks your defaults.\n\n"
+    )
+
+
+def constraints_block(plan_text: str) -> str:
+    lines = extract_constraint_lines(plan_text)
+    if not lines:
+        return ""
+    return (
+        "Hard constraints found in the plan (echo and honor them; they are "
+        "protected by the append-only rule):\n"
+        + "\n".join(f"- {line}" for line in lines)
+        + "\n\n"
+    )
+
+
+def require_headings_preserved(existing: str, updated: str, context: str) -> None:
+    """Reject a plan update that deletes body sections.
+
+    The plan is the run's contract: agents may update todo statuses and
+    append sections, but a heading that exists on disk must survive every
+    update. The coordinator owns the write path, so a violating update is
+    rejected before anything touches the file.
+    """
+    missing = missing_headings(plan_headings(existing), plan_headings(updated))
+    if not missing:
+        return
+    raise SystemExit(
+        f"Plan update rejected ({context}): it would delete sections: "
+        + "; ".join(missing)
+        + "\nThe plan body is append-only: updates may change todo statuses "
+        "and append notes, but must never delete or rewrite existing "
+        "sections.\nThe plan file on disk was left untouched. Resume the run "
+        "to retry the turn, or append the update manually."
+    )
+
+
 def persist_review_output(path: pathlib.Path, output: str, dry_run: bool, trace: WorkflowTrace) -> None:
     if not output.strip():
         trace.event(f"review output empty; no fallback write for {path.name}")
@@ -1197,6 +1364,7 @@ def persist_plan_markdown(
     if existing.strip() == plan.strip():
         trace.event(f"plan unchanged after {reason}: {path.name}")
         return False
+    require_headings_preserved(existing, plan, reason)
     path.write_text(plan.rstrip() + "\n", encoding="utf-8")
     trace.event(f"persisted plan stdout ({reason}): {path.name}")
     return True
@@ -1256,13 +1424,12 @@ def resolve_repo_path(repo: pathlib.Path, value: pathlib.Path) -> pathlib.Path:
 
 def open_or_update_pr(
     repo: pathlib.Path,
-    base: str,
-    branch: str,
-    goal: str,
-    plan: str,
+    state: RunState,
+    plan_path: pathlib.Path,
     dry_run: bool,
     log: pathlib.Path,
 ) -> str:
+    base, branch, goal = state.base, state.branch, state.goal
     existing = gh_json(
         repo,
         ["pr", "list", "--head", branch, "--json", "number,url", "--limit", "1"],
@@ -1277,25 +1444,43 @@ def open_or_update_pr(
             raise SystemExit(f"Unexpected gh pr list output for branch {branch}: {existing!r}")
         return url
 
+    plan_text = read_if_present(plan_path)
+    closeout = extract_closeout(plan_text)
+    if closeout is None:
+        raise SystemExit(
+            "No PR opened: the plan has no valid `## Closeout` section.\n"
+            "Required labels, each on its own line: Verified:, "
+            "Attempted-blocked (cause):, Deferred (tracked in):, Not claimed:.\n"
+            f"Append the closeout to {plan_path} (or resume so the "
+            f"implementer adds it): a2a-loop --resume {state.run_id}"
+        )
+    constraints = extract_constraint_lines(plan_text)
+    briefing = ""
+    if state.final_review_path:
+        briefing = read_if_present(
+            resolve_repo_path(repo, pathlib.Path(state.final_review_path))
+        ).strip()
+
     ensure_branch_has_pr_commits(repo, base, branch, dry_run, log)
     push_result = run(["git", "push", "-u", "origin", branch], cwd=repo, dry_run=dry_run, log_file=log)
     require_ok(push_result, "branch push")
 
-    body = textwrap.dedent(
-        f"""
-        ## Goal
-
-        {goal}
-
-        ## Agent Plan
-
-        {plan.strip()}
-
-        ## Coordination
-
-        This PR was opened by the a2a-loop coordinator.
-        """
-    ).strip()
+    sections = [f"## Goal\n\n{goal}"]
+    if constraints:
+        sections.append(
+            "## Constraints acknowledged\n\n"
+            + "\n".join(f"- {line}" for line in constraints)
+        )
+    sections.append(f"## Agent Plan\n\n{plan_text.strip()}")
+    if briefing:
+        sections.append(f"## Reviewer briefing\n\n{briefing}")
+    sections.append(f"## Closeout\n\n{closeout}")
+    sections.append(
+        "## Coordination\n\n"
+        "This PR was opened by the a2a-loop coordinator. Merge decisions "
+        "belong to a human or a separate review session."
+    )
+    body = "\n\n".join(sections)
     return gh_text(
         repo,
         [
@@ -1394,7 +1579,7 @@ def commit_message_from_output(output: str, fallback: str) -> str:
     return extract_commit_message(output) or fallback
 
 
-def build_plan_prompt(goal: str, base: str, plan_path: str) -> str:
+def build_plan_prompt(goal: str, base: str, plan_path: str, conventions: str = "") -> str:
     return f"""
 You are the planner in an agent-to-agent workflow.
 
@@ -1403,7 +1588,7 @@ Target goal:
 
 Base branch: {base}
 
-Return the complete implementation plan in stdout. The coordinator will persist it to:
+{conventions}Return the complete implementation plan in stdout. The coordinator will persist it to:
 {plan_path}
 Do not include commentary outside the plan markdown except the final {PLAN_READY_TOKEN} line.
 
@@ -1413,13 +1598,18 @@ Use the dirtybits/agent-skills `plan-writing` convention for `.plan.md` files:
   concrete `content`, and `status: pending`.
 - After frontmatter, include Markdown sections for goal, scope, files to change,
   implementation steps, verification, rollout/rollback if relevant, and blockers.
+- Give each todo explicit done-when criteria so completion can be verified,
+  not asserted.
+- Mark hard ordering or decision constraints with explicit `SEQUENCING:` or
+  `DECISION:` callouts; they are a control channel to the implementer and
+  reviewer and must survive every later plan update.
 - Include enough repo-specific detail that the implementer can proceed without guessing.
 
 Do not write plan files yourself. Do not edit source files. End your response with {PLAN_READY_TOKEN}.
 """.strip()
 
 
-def build_plan_review_prompt(goal: str, base: str, plan_path: str) -> str:
+def build_plan_review_prompt(goal: str, base: str, plan_path: str, conventions: str = "") -> str:
     return f"""
 You are the implementer, reviewing the plan before implementation.
 
@@ -1428,7 +1618,7 @@ Goal:
 
 Base branch: {base}
 
-Read the current plan at:
+{conventions}Read the current plan at:
 {plan_path}
 
 Inspect the repo enough to catch missing steps, risky assumptions, weak tests,
@@ -1436,6 +1626,10 @@ or repo-specific implementation details. Return the complete updated plan
 markdown in stdout, adding an "Implementer Review" or "Implementation
 Enhancements" section. Preserve the plan-writing frontmatter shape and keep
 todo ids stable.
+
+The plan body is append-only: add sections and notes, but never delete or
+rewrite existing sections or drop SEQUENCING/DECISION callouts — the
+coordinator rejects updates that delete sections.
 Do not include commentary outside the plan markdown except the final {PLAN_REVIEW_READY_TOKEN} line.
 
 Do not write plan files yourself. Do not implement the feature yet. End your response with {PLAN_REVIEW_READY_TOKEN}.
@@ -1461,12 +1655,20 @@ If changes are still needed, return the complete updated plan markdown in stdout
 with a concise "Reviewer Follow-up" section and end with exactly:
 {PLAN_CHANGES_TOKEN}
 Do not include commentary outside the plan markdown when returning changes.
+The plan body is append-only: add your follow-up section, but never delete or
+rewrite existing sections or drop SEQUENCING/DECISION callouts.
 
 Do not write plan files yourself. Do not implement the feature.
 """.strip()
 
 
-def build_implement_prompt(goal: str, plan_path: str, base: str) -> str:
+def build_implement_prompt(
+    goal: str,
+    plan_path: str,
+    base: str,
+    conventions: str = "",
+    constraints: str = "",
+) -> str:
     return f"""
 You are the implementer in an agent-to-agent workflow.
 
@@ -1476,17 +1678,36 @@ Goal:
 Plan file:
 {plan_path}
 
-Instructions:
+{conventions}{constraints}Instructions:
 - Read the plan file before editing.
 - Inspect the repo before editing.
+- First, pre-classify each plan verification step as runnable or blocked in
+  this environment (network access, secrets, build tools, browsers). State
+  the classification up front and record blocked steps as deferred in the
+  plan update now, instead of discovering them mid-run.
 - Track plan todo status mentally while working. If todo status/body should
   change, include a complete updated plan in stdout between:
   {PLAN_UPDATE_BEGIN}
   ...complete updated plan markdown...
   {PLAN_UPDATE_END}
   The coordinator will persist the plan update.
+- The plan body is append-only: update todo statuses and append dated
+  progress/divergence notes at the point of divergence, but never delete or
+  rewrite existing sections (Goal, Scope, Rollback, decision or sequencing
+  notes). The coordinator rejects updates that delete sections.
+- Treat SEQUENCING, DECISION, stop-the-line, and founder-acked notes in the
+  plan as hard constraints.
+- Set a todo to `completed` only when every done-when item is met; otherwise
+  leave it `in_progress` and append a dated deferral note naming where the
+  remainder is tracked.
 - Implement the smallest complete change that satisfies the plan.
-- Run relevant tests/checks.
+- Run relevant tests/checks. Report each result together with the working
+  directory it ran in and the exact command, so results are bound to this
+  worktree and not another checkout.
+- Maintain a `## Closeout` section in the plan update with exactly these
+  four labels, each starting its own line: `Verified:`,
+  `Attempted-blocked (cause):`, `Deferred (tracked in):`, `Not claimed:`.
+  The coordinator refuses to open a PR without it.
 - Optionally suggest the coordinator commit subject in stdout between:
   {COMMIT_MESSAGE_BEGIN}
   concise commit subject
@@ -1522,6 +1743,18 @@ state over conversation history. Useful commands include:
 Return your complete review in stdout. The coordinator will persist it to:
 {review_path}
 
+Review duties beyond the diff itself:
+- Verify plan todo statuses match reality: a todo may be `completed` only if
+  every done-when item is met. Overclaimed statuses are changes to request.
+- Verify the plan's `## Closeout` section is honest: nothing under
+  `Verified:` that was not actually run, and blocked/deferred work named as
+  such.
+- Verify claimed test results are plausible for this worktree and diff;
+  re-run cheap checks yourself when in doubt.
+- If other open PRs touch the same subsystem, state the required merge order
+  and semantic-conflict risks. Never call this change independent of them
+  unless the combination was actually tested.
+
 If changes are needed:
 - Include actionable findings in your stdout review.
 - End your response with exactly:
@@ -1529,6 +1762,10 @@ If changes are needed:
 
 If the implementation satisfies the goal and tests are adequate:
 - Include a concise approval summary in your stdout review.
+- Include a `## Reviewer briefing` section for the human or external
+  reviewer: the riskiest hunks, the invariants to verify, what to try to
+  break, and what earlier internal review rounds already caught and fixed
+  (so it is not re-litigated). This section is copied into the PR body.
 - End your response with exactly:
 {APPROVAL_TOKEN}
 
@@ -1536,7 +1773,13 @@ Do not write review files yourself. Do not merge, push, or edit source files.
 """.strip()
 
 
-def build_local_fix_prompt(goal: str, base: str, plan_path: str, review_path: str) -> str:
+def build_local_fix_prompt(
+    goal: str,
+    base: str,
+    plan_path: str,
+    review_path: str,
+    constraints: str = "",
+) -> str:
     return f"""
 You are the fixer in a local-first agent-to-agent workflow.
 
@@ -1549,7 +1792,7 @@ Plan file:
 Review file:
 {review_path}
 
-Instructions:
+{constraints}Instructions:
 - Read the plan and review files.
 - Inspect the local diff against `{base}`.
 - Track plan todo status mentally while working. If todo status/body should
@@ -1558,8 +1801,17 @@ Instructions:
   ...complete updated plan markdown...
   {PLAN_UPDATE_END}
   The coordinator will persist the plan update.
+- The plan body is append-only: update todo statuses and append dated notes,
+  but never delete or rewrite existing sections. The coordinator rejects
+  updates that delete sections.
+- Treat SEQUENCING, DECISION, stop-the-line, and founder-acked notes in the
+  plan as hard constraints.
+- Set a todo to `completed` only when every done-when item is met.
+- Keep the plan's `## Closeout` section current (labels `Verified:`,
+  `Attempted-blocked (cause):`, `Deferred (tracked in):`, `Not claimed:`).
 - Address all actionable review comments.
-- Run relevant tests/checks.
+- Run relevant tests/checks. Report each result together with the working
+  directory it ran in and the exact command.
 - Optionally suggest the coordinator commit subject in stdout between:
   {COMMIT_MESSAGE_BEGIN}
   concise commit subject
@@ -1585,6 +1837,15 @@ PR:
 
 Review the PR diff and current branch. Use GitHub CLI if available to inspect the PR.
 
+Review duties beyond the diff itself:
+- Confirm the test/CI workflow actually ran on the PR's current head SHA
+  (`gh api "repos/<owner>/<repo>/actions/runs?head_sha=<sha>"`). A green
+  deployment preview alone is never sufficient evidence; if CI skipped the
+  SHA (e.g. after a rebase), request a re-trigger (close/reopen the PR).
+- If other open PRs touch the same subsystem, state the required merge order
+  and semantic-conflict risks. Never call this PR independent of them unless
+  the combination was actually tested.
+
 If changes are needed:
 - Leave actionable PR comments or a clear review summary.
 - End with REVIEW_STATUS: changes_requested.
@@ -1597,7 +1858,7 @@ Do not merge the PR.
 """.strip()
 
 
-def build_gh_fix_prompt(goal: str, pr_url: str, review: str) -> str:
+def build_gh_fix_prompt(goal: str, pr_url: str, review: str, constraints: str = "") -> str:
     return f"""
 You are the fixer in an agent-to-agent workflow.
 
@@ -1610,10 +1871,14 @@ PR:
 Reviewer output:
 {review}
 
-Instructions:
+{constraints}Instructions:
 - Inspect PR comments and the diff.
 - Address all actionable comments.
-- Run relevant tests/checks.
+- Run relevant tests/checks. Report each result together with the working
+  directory it ran in and the exact command.
+- The plan body is append-only: update todo statuses and append dated notes,
+  but never delete or rewrite existing sections. Keep the `## Closeout`
+  section current.
 - If todo status/body should change, include a complete updated plan in stdout between:
   {PLAN_UPDATE_BEGIN}
   ...complete updated plan markdown...
@@ -1647,7 +1912,7 @@ def negotiate_plan(
             plan_output = run_agent(
                 state.planner,
                 "write implementation plan",
-                build_plan_prompt(state.goal, state.base, plan_rel),
+                build_plan_prompt(state.goal, state.base, plan_rel, conventions_note(repo)),
                 repo,
                 dry_run,
                 log,
@@ -1687,7 +1952,7 @@ def negotiate_plan(
         review_output = run_agent(
             state.implementer,
             "review and enhance plan",
-            build_plan_review_prompt(state.goal, state.base, plan_rel),
+            build_plan_review_prompt(state.goal, state.base, plan_rel, conventions_note(repo)),
             repo,
             dry_run,
             log,
@@ -1814,6 +2079,7 @@ def run_local_review_loop(
             )
             state.phase = "approved"
             state.approved = True
+            state.final_review_path = review_rel
             save_state(repo, state, dry_run, trace)
             return True
 
@@ -1834,7 +2100,13 @@ def run_local_review_loop(
         fix_output = run_agent(
             state.implementer,
             "fix local review comments",
-            build_local_fix_prompt(state.goal, state.base, plan_rel, review_rel),
+            build_local_fix_prompt(
+                state.goal,
+                state.base,
+                plan_rel,
+                review_rel,
+                constraints_block(read_if_present(plan_path)),
+            ),
             repo,
             dry_run,
             log,
@@ -1926,10 +2198,16 @@ def run_gh_review_loop(
                 ("Next", f"{state.implementer} fixes PR comments"),
             ],
         )
+        plan_path = resolve_repo_path(repo, pathlib.Path(state.plan_path))
         fix_output = run_agent(
             state.implementer,
             "fix GitHub review comments",
-            build_gh_fix_prompt(state.goal, state.pr_url, review),
+            build_gh_fix_prompt(
+                state.goal,
+                state.pr_url,
+                review,
+                constraints_block(read_if_present(plan_path)),
+            ),
             repo,
             dry_run,
             log,
@@ -1937,7 +2215,6 @@ def run_gh_review_loop(
             state,
             artifact=state.pr_url,
         )
-        plan_path = resolve_repo_path(repo, pathlib.Path(state.plan_path))
         persist_plan_update_block(plan_path, fix_output, dry_run, trace, f"GitHub fix round {round_index} stdout")
         sync_source_plan(repo, plan_path, state, dry_run, trace)
         commit_hash = commit_if_changed(
@@ -2064,6 +2341,12 @@ def main() -> int:
     # A2A_CLAUDE_EFFORT is checked here on the resolved value.
     if args.claude_effort and args.claude_effort not in CLAUDE_EFFORTS:
         raise SystemExit("Claude effort must be one of: " + ", ".join(CLAUDE_EFFORTS))
+    if args.merge and args.resume is None and args.implementer == args.reviewer:
+        raise SystemExit(
+            "--merge requires distinct --implementer and --reviewer agents "
+            "(self-merge guard): the author of a change must not be its only "
+            "merge gate. Run without --merge and merge manually instead."
+        )
     codex_display_model = args.codex_model or "unknown"
     codex_display_effort = args.codex_effort or "unknown"
     claude_display_model = args.claude_model or "unknown"
@@ -2235,6 +2518,7 @@ def main() -> int:
 
     ensure_a2a_dirs(repo, args.dry_run)
     trace.event(f"repo: {repo}")
+    trace_capability_manifest(repo, args.dry_run, log, trace)
     if state.verbose:
         trace.event("verbose output: summarized agent text, tool events, stderr, and post-turn diffstats")
     trace.event(f"Codex auth status: {codex_auth_status(repo, args.dry_run, log)}")
@@ -2252,11 +2536,11 @@ def main() -> int:
         checkout_branch(repo, state.branch, args.dry_run, log)
     else:
         trace.event(f"branch setup: {state.branch}")
-        ensure_branch(repo, state.branch, args.dry_run, log)
+        ensure_branch(repo, state.branch, state.base, args.dry_run, log, trace)
         ensure_gitignore(repo, args.dry_run, trace)
         save_state(repo, state, args.dry_run, trace)
 
-    plan = negotiate_plan(
+    negotiate_plan(
         repo,
         plan_path,
         args.dry_run,
@@ -2270,7 +2554,13 @@ def main() -> int:
         implement_output = run_agent(
             state.implementer,
             "implement approved plan",
-            build_implement_prompt(state.goal, repo_relative(repo, plan_path), state.base),
+            build_implement_prompt(
+                state.goal,
+                repo_relative(repo, plan_path),
+                state.base,
+                conventions_note(repo),
+                constraints_block(read_if_present(plan_path)),
+            ),
             repo,
             args.dry_run,
             log,
@@ -2335,7 +2625,7 @@ def main() -> int:
                     "Final changes: committed before GitHub review",
                     [("Commit", commit_hash)],
                 )
-            state.pr_url = open_or_update_pr(repo, state.base, state.branch, state.goal, plan, args.dry_run, log)
+            state.pr_url = open_or_update_pr(repo, state, plan_path, args.dry_run, log)
             state.phase = "pr_ready"
             save_state(repo, state, args.dry_run, trace)
         approved = state.phase == "approved" or run_gh_review_loop(
@@ -2373,7 +2663,7 @@ def main() -> int:
                         "Final changes: committed before PR",
                         [("Commit", commit_hash)],
                     )
-                state.pr_url = open_or_update_pr(repo, state.base, state.branch, state.goal, plan, args.dry_run, log)
+                state.pr_url = open_or_update_pr(repo, state, plan_path, args.dry_run, log)
                 save_state(repo, state, args.dry_run, trace)
 
     if not approved:
@@ -2384,10 +2674,28 @@ def main() -> int:
         return 2
 
     trace.event(f"approved by {state.reviewer}. PR: {state.pr_url}")
+    if state.merge and state.implementer == state.reviewer:
+        trace.event(
+            "merge refused: implementer and reviewer are the same agent "
+            "(self-merge guard); merge manually or rerun with distinct roles"
+        )
+        state.merge = False
     if state.merge:
-        trace.event(f"merge requested: squash {state.pr_url}")
-        gh_text(repo, ["pr", "merge", state.pr_url, "--squash", "--delete-branch"], args.dry_run, log)
-        trace.event("squash merge requested")
+        # CI must have run on the PR's current head SHA; a rebase or filtered
+        # workflow can leave only a deployment preview green, which is not
+        # evidence the change was tested.
+        checks = run(["gh", "pr", "checks", state.pr_url], cwd=repo, dry_run=args.dry_run, log_file=log)
+        checks_output = (checks.stdout + checks.stderr).lower()
+        if checks.returncode != 0 and "no checks reported" not in checks_output:
+            trace.event(
+                "merge blocked: PR checks are failing or still pending on the "
+                "head SHA; merge manually once they pass (re-trigger skipped "
+                "workflows by closing and reopening the PR)"
+            )
+        else:
+            trace.event(f"merge requested: squash {state.pr_url}")
+            gh_text(repo, ["pr", "merge", state.pr_url, "--squash", "--delete-branch"], args.dry_run, log)
+            trace.event("squash merge requested")
     else:
         trace.event("merge skipped; pass --merge to squash merge automatically")
     state.phase = "done"

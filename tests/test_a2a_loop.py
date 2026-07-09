@@ -110,17 +110,32 @@ class EnsureBranchTests(unittest.TestCase):
         result = subprocess.run(["git", *args], cwd=self.repo, check=True, text=True, stdout=subprocess.PIPE)
         return result.stdout.strip()
 
+    def trace(self) -> "a2a.WorkflowTrace":
+        return a2a.WorkflowTrace(self.log)
+
     def test_existing_branch_is_not_reset(self):
-        a2a.ensure_branch(self.repo, "a2a/existing", dry_run=False, log=self.log)
+        a2a.ensure_branch(self.repo, "a2a/existing", self.initial_branch, dry_run=False, log=self.log, trace=self.trace())
         branch_head = self.git("rev-parse", "HEAD")
         subprocess.run(["git", "checkout", self.initial_branch], cwd=self.repo, check=True, stdout=subprocess.PIPE)
         (self.repo / "file.txt").write_text("main moved\n", encoding="utf-8")
         subprocess.run(["git", "commit", "-am", "main moved"], cwd=self.repo, check=True, stdout=subprocess.PIPE)
 
-        a2a.ensure_branch(self.repo, "a2a/existing", dry_run=False, log=self.log)
+        a2a.ensure_branch(self.repo, "a2a/existing", self.initial_branch, dry_run=False, log=self.log, trace=self.trace())
 
         self.assertEqual(self.git("branch", "--show-current"), "a2a/existing")
         self.assertEqual(self.git("rev-parse", "HEAD"), branch_head)
+
+    def test_new_branch_starts_from_base_not_current_head(self):
+        # Simulate stale local state: a side branch ahead of base.
+        base_head = self.git("rev-parse", "HEAD")
+        subprocess.run(["git", "checkout", "-b", "side"], cwd=self.repo, check=True, stdout=subprocess.PIPE)
+        (self.repo / "file.txt").write_text("side work\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "side work"], cwd=self.repo, check=True, stdout=subprocess.PIPE)
+
+        a2a.ensure_branch(self.repo, "a2a/fresh", self.initial_branch, dry_run=False, log=self.log, trace=self.trace())
+
+        self.assertEqual(self.git("branch", "--show-current"), "a2a/fresh")
+        self.assertEqual(self.git("rev-parse", "HEAD"), base_head)
 
 
 class RunOutputTests(unittest.TestCase):
@@ -332,6 +347,7 @@ class StateRoundTripTests(unittest.TestCase):
             claude_model_source="--claude-model",
             claude_effort_source="--claude-effort",
             log_path=str(self.repo / "run.log"),
+            decision_log_path=".a2a/runs/test-run/decisions.md",
         )
 
     def test_save_then_load_round_trips(self):
@@ -406,6 +422,125 @@ class AgentErrorScanTests(unittest.TestCase):
         transcript = "ERROR: unexpected status\n" + "\n".join(f"line {i}" for i in range(100))
         result = self.make_result(stdout=transcript)
         a2a.require_no_agent_error(result, "Codex turn")
+
+
+class PlanHeadingsTests(unittest.TestCase):
+    PLAN = "# Goal\n\ntext\n\n## Scope\n\nmore\n\n### Rollback\n\nsteps\n"
+
+    def test_collects_all_levels(self):
+        self.assertEqual(a2a.plan_headings(self.PLAN), ["# Goal", "## Scope", "### Rollback"])
+
+    def test_missing_headings_detects_deletion(self):
+        before = a2a.plan_headings(self.PLAN)
+        after = a2a.plan_headings("# Goal\n\n## Scope\n")
+        self.assertEqual(a2a.missing_headings(before, after), ["### Rollback"])
+
+    def test_missing_headings_handles_duplicates(self):
+        before = ["## Notes", "## Notes"]
+        after = ["## Notes"]
+        self.assertEqual(a2a.missing_headings(before, after), ["## Notes"])
+
+    def test_additions_are_allowed(self):
+        before = a2a.plan_headings(self.PLAN)
+        after = a2a.plan_headings(self.PLAN + "\n## Closeout\n")
+        self.assertEqual(a2a.missing_headings(before, after), [])
+
+    def test_require_headings_preserved_raises_on_deletion(self):
+        with self.assertRaises(SystemExit):
+            a2a.require_headings_preserved(self.PLAN, "# Goal\n\n## Scope\n", "test update")
+
+    def test_require_headings_preserved_allows_appends(self):
+        a2a.require_headings_preserved(self.PLAN, self.PLAN + "\n## Extra\n", "test update")
+
+
+class PersistPlanMarkdownGuardTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = pathlib.Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.trace = a2a.WorkflowTrace(self.repo / "run.log")
+        self.plan = self.repo / "test.plan.md"
+        self.plan.write_text("# Goal\n\ntext\n\n## Rollback\n\nsteps\n", encoding="utf-8")
+
+    def test_update_deleting_section_is_rejected_and_file_untouched(self):
+        original = self.plan.read_text(encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            a2a.persist_plan_markdown(
+                self.plan, "# Goal\n\nrewritten\n", dry_run=False, trace=self.trace, reason="test", tokens=set()
+            )
+        self.assertEqual(self.plan.read_text(encoding="utf-8"), original)
+
+    def test_appending_update_is_persisted(self):
+        updated = self.plan.read_text(encoding="utf-8") + "\n## Closeout\n\nVerified: none\n"
+        self.assertTrue(
+            a2a.persist_plan_markdown(
+                self.plan, updated, dry_run=False, trace=self.trace, reason="test", tokens=set()
+            )
+        )
+        self.assertIn("## Closeout", self.plan.read_text(encoding="utf-8"))
+
+
+class ExtractCloseoutTests(unittest.TestCase):
+    VALID = (
+        "# Plan\n\nbody\n\n## Closeout\n\n"
+        "Verified: unit tests pass\n"
+        "Attempted-blocked (cause): live smoke (no relayer key)\n"
+        "Deferred (tracked in): follow-up issue #12\n"
+        "Not claimed: production behavior\n"
+    )
+
+    def test_valid_closeout_is_extracted(self):
+        section = a2a.extract_closeout(self.VALID)
+        self.assertIsNotNone(section)
+        self.assertIn("Verified: unit tests pass", section)
+
+    def test_missing_section_returns_none(self):
+        self.assertIsNone(a2a.extract_closeout("# Plan\n\nbody\n"))
+
+    def test_section_missing_labels_returns_none(self):
+        text = "# Plan\n\n## Closeout\n\nVerified: tests\n"
+        self.assertIsNone(a2a.extract_closeout(text))
+
+    def test_section_ends_at_next_heading(self):
+        text = self.VALID + "\n## After\n\nVerified: bogus\n"
+        section = a2a.extract_closeout(text)
+        self.assertNotIn("bogus", section)
+
+
+class ConstraintEchoTests(unittest.TestCase):
+    def test_marker_lines_are_extracted(self):
+        text = (
+            "# Plan\n"
+            "SEQUENCING: update-first ordering (founder-acked)\n"
+            "normal line\n"
+            "DECISION: keep dispute lock\n"
+        )
+        lines = a2a.extract_constraint_lines(text)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("SEQUENCING: update-first ordering (founder-acked)", lines)
+
+    def test_no_markers_yield_empty_block(self):
+        self.assertEqual(a2a.constraints_block("# Plan\n\nnothing special\n"), "")
+
+    def test_block_lists_constraints(self):
+        block = a2a.constraints_block("DECISION: keep dispute lock\n")
+        self.assertIn("- DECISION: keep dispute lock", block)
+
+
+class ConventionsNoteTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = pathlib.Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_empty_when_no_convention_files(self):
+        self.assertEqual(a2a.conventions_note(self.repo), "")
+
+    def test_names_existing_files(self):
+        (self.repo / "AGENTS.md").write_text("rules\n", encoding="utf-8")
+        note = a2a.conventions_note(self.repo)
+        self.assertIn("AGENTS.md", note)
+        self.assertIn("outranks your defaults", note)
 
 
 if __name__ == "__main__":

@@ -77,6 +77,27 @@ MERGE_DECISION: APPROVE
 Anything else — including prose that merely mentions the token — keeps the
 loop alive or fails closed.
 
+## Plan-as-Contract
+
+The plan file is the loop's contract, so the run must not have unrestricted
+write access to its own contract. The coordinator owns every plan write
+(agents return updates on stdout) and enforces:
+
+- Append-only body: updates that delete existing headings are rejected
+  before touching the file.
+- Constraint callouts (`SEQUENCING`, `DECISION`, `stop-the-line`,
+  `founder-acked`) survive every update and are echoed into prompts and the
+  PR body.
+- A `## Closeout` section with `Verified:` / `Attempted-blocked (cause):` /
+  `Deferred (tracked in):` / `Not claimed:` labels gates PR creation, so
+  verification claims are structured and honest.
+
+Direction of travel: make the plan's body sections literally read-only to
+the run, with all run-time writes going to separate ledgers. The decision
+log (`.a2a/runs/<run-id>/decisions.md`) is the first such ledger; todo
+status and closeout could move there next, leaving the human-authored plan
+body immutable for the run's lifetime.
+
 ## Safety Rails
 
 - Run in a disposable git worktree or clean branch.
