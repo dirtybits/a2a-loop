@@ -84,8 +84,9 @@ line. Codex defaults come from `~/.codex/config.toml`; Claude defaults come from
 default `high` when the settings file does not expose one. Override per run with
 `--codex-model`, `--codex-effort`, `--claude-model`, and `--claude-effort`, or use
 `A2A_CODEX_MODEL`, `A2A_CODEX_EFFORT`, `A2A_CLAUDE_MODEL`, and
-`A2A_CLAUDE_EFFORT`. Codex effort supports `minimal|low|medium|high`;
-compatibility aliases `extra-high`, `xhigh`, and `max` map to `high`. Claude
+`A2A_CLAUDE_EFFORT`. Codex effort supports
+`minimal|low|medium|high|xhigh|max|ultra`; GPT-5.6 Terra supports
+`low|medium|high|xhigh|max|ultra`, and `extra-high` maps to `xhigh`. Claude
 effort supports `low|medium|high|xhigh|max`. Claude uses local claude.ai
 login/subscription auth by default; pass `--claude-use-api-key` or set
 `A2A_CLAUDE_USE_API_KEY=1` only when API-key billing is intentional. The

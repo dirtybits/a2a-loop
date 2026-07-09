@@ -180,8 +180,8 @@ one. Override models and effort per run:
 ```bash
 a2a-loop \
   --goal "Implement the feature..." \
-  --codex-model gpt-5.5 \
-  --codex-effort high \
+  --codex-model gpt-5.6-terra \
+  --codex-effort max \
   --claude-model claude-fable-5 \
   --dry-run
 ```
@@ -189,24 +189,26 @@ a2a-loop \
 Or set environment variables:
 
 ```bash
-export A2A_CODEX_MODEL=gpt-5.5
-export A2A_CODEX_EFFORT=high
+export A2A_CODEX_MODEL=gpt-5.6-terra
+export A2A_CODEX_EFFORT=max
 export A2A_CLAUDE_MODEL=claude-fable-5
 ```
 
 Available model-related flags:
 
 ```text
---codex-model gpt-5.5
---codex-effort high
+--codex-model gpt-5.6-terra
+--codex-effort max
 --claude-model claude-fable-5
 --claude-effort high
 ```
 
 Codex effort resolves from `A2A_CODEX_EFFORT`, then
 `model_reasoning_effort` in `~/.codex/config.toml`. Supported Codex effort
-values are `minimal`, `low`, `medium`, and `high`. For compatibility,
-`extra-high`, `xhigh`, and `max` map to Codex `high`.
+values are `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
+GPT-5.6 Terra supports `low|medium|high|xhigh|max|ultra`; `max` is the
+recommended implementation default. For compatibility, `extra-high` maps to
+`xhigh`.
 
 Claude effort resolves from `A2A_CLAUDE_EFFORT`, then `effort` in
 `~/.claude/settings.json`, then the coordinator default `high`. Supported

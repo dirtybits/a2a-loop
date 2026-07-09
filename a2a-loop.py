@@ -47,11 +47,11 @@ COMMIT_MESSAGE_END = "A2A_COMMIT_MESSAGE_END"
 LATEST_RESUME = "__latest__"
 AGENTS = ("claude", "codex")
 STATE_VERSION = 1
-CODEX_EFFORTS = ("minimal", "low", "medium", "high")
+# Codex CLI 0.144.0 exposes expanded reasoning tiers for GPT-5.6 models.
+# Keep `minimal` for older Codex models that still accept it.
+CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 CODEX_EFFORT_ALIASES = {
-    "extra-high": "high",
-    "xhigh": "high",
-    "max": "high",
+    "extra-high": "xhigh",
 }
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_API_AUTH_ENV_VARS = (
@@ -139,7 +139,7 @@ def normalize_codex_effort(value: str | None) -> str | None:
         raise SystemExit(
             "Codex effort must be one of: "
             + ", ".join(accepted)
-            + ". Note: xhigh/max are Claude effort names and map to Codex high."
+            + ". GPT-5.6 supports xhigh, max, and ultra; extra-high maps to xhigh."
         )
     return normalized
 
