@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("a2a_loop", ROOT / "a2a-loop.py")
@@ -100,6 +101,7 @@ class EnsureBranchTests(unittest.TestCase):
         subprocess.run(["git", "init"], cwd=self.repo, check=True, stdout=subprocess.PIPE)
         subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "user.name", "Test"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=self.repo, check=True)
         (self.repo / "file.txt").write_text("base\n", encoding="utf-8")
         subprocess.run(["git", "add", "file.txt"], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-m", "base"], cwd=self.repo, check=True, stdout=subprocess.PIPE)
@@ -182,9 +184,12 @@ class NormalizeCodexEffortTests(unittest.TestCase):
     def test_valid_passthrough(self):
         self.assertEqual(a2a.normalize_codex_effort("medium"), "medium")
 
-    def test_aliases_map_to_high(self):
-        for alias in ("extra-high", "xhigh", "max"):
-            self.assertEqual(a2a.normalize_codex_effort(alias), "high")
+    def test_gpt_56_efforts_pass_through(self):
+        for effort in ("xhigh", "max", "ultra"):
+            self.assertEqual(a2a.normalize_codex_effort(effort), effort)
+
+    def test_extra_high_alias_maps_to_xhigh(self):
+        self.assertEqual(a2a.normalize_codex_effort("extra-high"), "xhigh")
 
     def test_invalid_raises(self):
         with self.assertRaises(SystemExit):
@@ -229,6 +234,35 @@ class EndsWithTokenTests(unittest.TestCase):
 
     def test_empty_output_does_not_match(self):
         self.assertFalse(a2a.ends_with_token("", self.TOKEN))
+
+
+class ImplementationStatusTests(unittest.TestCase):
+    def test_ready_requires_exact_final_line(self):
+        output = f"done\n{a2a.DECISION_REASON_PREFIX} tests pass\n{a2a.IMPLEMENTATION_READY_TOKEN}\n"
+        self.assertEqual(a2a.implementation_status(output), "ready")
+
+    def test_blocked_requires_exact_final_line(self):
+        output = f"stopped\n{a2a.DECISION_REASON_PREFIX} size gate failed\n{a2a.IMPLEMENTATION_BLOCKED_TOKEN}\n"
+        self.assertEqual(a2a.implementation_status(output), "blocked")
+
+    def test_status_token_followed_by_prose_is_missing(self):
+        output = f"{a2a.IMPLEMENTATION_READY_TOKEN}\nextra prose\n"
+        self.assertEqual(a2a.implementation_status(output), "missing")
+
+    def test_quoted_status_token_is_missing(self):
+        self.assertEqual(
+            a2a.implementation_status(f"I was asked to print {a2a.IMPLEMENTATION_READY_TOKEN}."),
+            "missing",
+        )
+
+
+class DecisionReasonTests(unittest.TestCase):
+    def test_explicit_reason_wins(self):
+        output = f"long review\n{a2a.DECISION_REASON_PREFIX} missing regression coverage\n{a2a.REVIEW_CHANGES_TOKEN}"
+        self.assertEqual(a2a.decision_reason(output), "missing regression coverage")
+
+    def test_falls_back_to_first_useful_line(self):
+        self.assertEqual(a2a.decision_reason("Looks good.\nMERGE_DECISION: APPROVE"), "Looks good.")
 
 
 class EnsureGitignoreTests(unittest.TestCase):
@@ -373,6 +407,145 @@ class StateRoundTripTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             a2a.load_state(path)
 
+    def test_old_checkpoint_gets_blocked_and_pending_defaults(self):
+        state = self.make_state()
+        a2a.save_state(self.repo, state, dry_run=False, trace=self.trace)
+        path = a2a.state_path(self.repo, state.run_id)
+        data = a2a.json.loads(path.read_text(encoding="utf-8"))
+        for key in ("blocked_reason", "blocked_resume_phase", "pending_review_path", "pending_review_round"):
+            data.pop(key)
+        path.write_text(a2a.json.dumps(data), encoding="utf-8")
+
+        loaded = a2a.load_state(path)
+
+        self.assertEqual(loaded.blocked_reason, "")
+        self.assertEqual(loaded.blocked_resume_phase, "")
+        self.assertEqual(loaded.pending_review_path, "")
+        self.assertEqual(loaded.pending_review_round, 0)
+
+
+class LocalReviewControlFlowTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = pathlib.Path(self._tmp.name).resolve()
+        self.addCleanup(self._tmp.cleanup)
+        self.plan = self.repo / ".a2a" / "plans" / "test.plan.md"
+        self.plan.parent.mkdir(parents=True)
+        self.plan.write_text("# Goal\n\nTest.\n", encoding="utf-8")
+        self.log = self.repo / ".a2a" / "logs" / "test-run" / "run.log"
+        self.trace = a2a.WorkflowTrace(self.log)
+        self.state = a2a.RunState(
+            version=a2a.STATE_VERSION,
+            run_id="test-run",
+            repo=str(self.repo),
+            branch="a2a/test",
+            base="main",
+            goal="test goal",
+            plan_path=".a2a/plans/test.plan.md",
+            source_plan_path=None,
+            planner="claude",
+            implementer="codex",
+            reviewer="claude",
+            max_plan_rounds=2,
+            max_rounds=1,
+            skip_plan_review=False,
+            gh_review=False,
+            merge=False,
+            codex_model="gpt-5.6-terra",
+            codex_effort="max",
+            codex_display_model="gpt-5.6-terra",
+            codex_display_effort="max",
+            codex_model_source="test",
+            codex_effort_source="test",
+            claude_model="fable",
+            claude_effort="high",
+            claude_display_model="fable",
+            claude_display_effort="high",
+            claude_model_source="test",
+            claude_effort_source="test",
+            log_path=str(self.log),
+            decision_log_path=".a2a/runs/test-run/decisions.md",
+            phase="implementation_ready",
+        )
+
+    def changes_requested(self) -> str:
+        return (
+            "Fix the regression.\n"
+            f"{a2a.DECISION_REASON_PREFIX} regression coverage is missing\n"
+            f"{a2a.REVIEW_CHANGES_TOKEN}\n"
+        )
+
+    def ready_fix(self) -> str:
+        return (
+            f"{a2a.DECISION_REASON_PREFIX} regression test added\n"
+            f"{a2a.IMPLEMENTATION_READY_TOKEN}\n"
+        )
+
+    def test_legacy_checkpoint_recovers_persisted_review_as_pending_fix(self):
+        self.state.local_review_round = 2
+        review = self.repo / ".a2a" / "reviews" / "test-run" / "review-2.md"
+        review.parent.mkdir(parents=True)
+        review.write_text(self.changes_requested(), encoding="utf-8")
+        decisions = self.repo / ".a2a" / "runs" / "test-run" / "decisions.md"
+        decisions.parent.mkdir(parents=True)
+        decisions.write_text("## Local review round 2: changes requested\n", encoding="utf-8")
+
+        migrated = a2a.migrate_legacy_pending_fix(self.repo, self.state)
+
+        self.assertEqual(migrated, ".a2a/reviews/test-run/review-2.md")
+        self.assertEqual(self.state.phase, "local_fix_pending")
+        self.assertEqual(self.state.pending_review_round, 2)
+        self.assertEqual(self.state.pending_review_path, migrated)
+
+    def test_no_commit_stops_as_blocked_instead_of_reviewing_again(self):
+        with mock.patch.object(
+            a2a, "run_agent", side_effect=[self.changes_requested(), self.ready_fix()]
+        ) as run_agent, mock.patch.object(a2a, "commit_if_changed", return_value=None):
+            approved = a2a.run_local_review_loop(
+                self.repo, self.plan, False, self.log, self.trace, self.state
+            )
+
+        self.assertFalse(approved)
+        self.assertEqual(run_agent.call_count, 2)
+        self.assertEqual(self.state.phase, "blocked")
+        self.assertIn("no committable progress", self.state.blocked_reason)
+        self.assertEqual(self.state.blocked_resume_phase, "local_fix_pending")
+
+    def test_review_without_reason_stops_before_fixer(self):
+        review = f"Fix the regression.\n{a2a.REVIEW_CHANGES_TOKEN}\n"
+        with mock.patch.object(a2a, "run_agent", return_value=review) as run_agent, mock.patch.object(
+            a2a, "commit_if_changed"
+        ) as commit:
+            approved = a2a.run_local_review_loop(
+                self.repo, self.plan, False, self.log, self.trace, self.state
+            )
+
+        self.assertFalse(approved)
+        self.assertEqual(run_agent.call_count, 1)
+        commit.assert_not_called()
+        self.assertEqual(self.state.phase, "blocked")
+        self.assertIn("A2A_REASON", self.state.blocked_reason)
+
+    def test_pending_fix_resume_skips_completed_review(self):
+        review = self.repo / ".a2a" / "reviews" / "test-run" / "review-1.md"
+        review.parent.mkdir(parents=True)
+        review.write_text(self.changes_requested(), encoding="utf-8")
+        self.state.phase = "local_fix_pending"
+        self.state.pending_review_path = ".a2a/reviews/test-run/review-1.md"
+        self.state.pending_review_round = 1
+        with mock.patch.object(a2a, "run_agent", return_value=self.ready_fix()) as run_agent, mock.patch.object(
+            a2a, "commit_if_changed", return_value="abc123"
+        ):
+            approved = a2a.run_local_review_loop(
+                self.repo, self.plan, False, self.log, self.trace, self.state
+            )
+
+        self.assertFalse(approved)
+        self.assertEqual(run_agent.call_count, 1)
+        self.assertEqual(run_agent.call_args.args[1], "fix local review comments")
+        self.assertEqual(self.state.phase, "implementation_ready")
+        self.assertEqual(self.state.pending_review_path, "")
+
 
 class PersistReviewOutputTests(unittest.TestCase):
     def setUp(self):
@@ -478,6 +651,250 @@ class PersistPlanMarkdownGuardTests(unittest.TestCase):
             )
         )
         self.assertIn("## Closeout", self.plan.read_text(encoding="utf-8"))
+
+
+class PersistPlanAppendTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = pathlib.Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.trace = a2a.WorkflowTrace(self.repo / "run.log")
+        self.plan = self.repo / "test.plan.md"
+        self.plan.write_text("# Goal\n\nKeep this.\n", encoding="utf-8")
+
+    def output(self, body: str) -> str:
+        return (
+            f"{a2a.PLAN_APPEND_BEGIN}\n{body}\n{a2a.PLAN_APPEND_END}\n"
+            f"{a2a.DECISION_REASON_PREFIX} added implementation details\n"
+            f"{a2a.PLAN_REVIEW_READY_TOKEN}\n"
+        )
+
+    def test_appends_only_delta(self):
+        changed = a2a.persist_plan_revision(
+            self.plan,
+            self.output("## Implementer Review\n\nAdd a regression test."),
+            dry_run=False,
+            trace=self.trace,
+            reason="test",
+            tokens={a2a.PLAN_REVIEW_READY_TOKEN},
+        )
+        self.assertTrue(changed)
+        text = self.plan.read_text(encoding="utf-8")
+        self.assertIn("Keep this.", text)
+        self.assertEqual(text.count("## Implementer Review"), 1)
+
+    def test_duplicate_delta_is_idempotent(self):
+        output = self.output("## Implementer Review\n\nAdd a regression test.")
+        a2a.persist_plan_revision(
+            self.plan, output, False, self.trace, "first", {a2a.PLAN_REVIEW_READY_TOKEN}
+        )
+        changed = a2a.persist_plan_revision(
+            self.plan, output, False, self.trace, "second", {a2a.PLAN_REVIEW_READY_TOKEN}
+        )
+        self.assertFalse(changed)
+
+    def test_delta_must_start_with_heading(self):
+        with self.assertRaises(SystemExit):
+            a2a.persist_plan_revision(
+                self.plan,
+                self.output("plain paragraph"),
+                False,
+                self.trace,
+                "test",
+                {a2a.PLAN_REVIEW_READY_TOKEN},
+            )
+
+
+class SourcePlanSyncTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = pathlib.Path(self._tmp.name).resolve()
+        self.addCleanup(self._tmp.cleanup)
+        self.trace = a2a.WorkflowTrace(self.repo / "run.log")
+        self.source = self.repo / ".agents" / "plans" / "test.plan.md"
+        self.working = self.repo / ".a2a" / "plans" / "run-test.plan.md"
+        self.source.parent.mkdir(parents=True)
+        self.working.parent.mkdir(parents=True)
+        self.source.write_text("# Plan\n\nBaseline.\n", encoding="utf-8")
+        self.working.write_text(self.source.read_text(encoding="utf-8"), encoding="utf-8")
+        self.state = StateRoundTripTests.make_state.__get__(self, type(self))()
+        self.state.repo = str(self.repo)
+        self.state.source_plan_path = ".agents/plans/test.plan.md"
+        self.state.plan_path = ".a2a/plans/run-test.plan.md"
+        self.state.source_plan_sha256 = a2a.plan_digest(
+            self.source.read_text(encoding="utf-8")
+        )
+        self.state.phase = "plan_written"
+
+    def test_source_only_operator_edit_is_imported_into_working_ledger(self):
+        operator_plan = "# Plan\n\nBaseline.\n\n## Operator Decision\n\nKeep lock-at-file.\n"
+        self.source.write_text(operator_plan, encoding="utf-8")
+
+        synced = a2a.sync_source_plan(
+            self.repo, self.working, self.state, dry_run=False, trace=self.trace
+        )
+
+        self.assertTrue(synced)
+        self.assertEqual(self.working.read_text(encoding="utf-8"), operator_plan)
+        self.assertEqual(self.source.read_text(encoding="utf-8"), operator_plan)
+
+    def test_working_only_agent_edit_is_exported_to_source(self):
+        reviewed_plan = "# Plan\n\nBaseline.\n\n## Implementer Review\n\nAdd tests.\n"
+        self.working.write_text(reviewed_plan, encoding="utf-8")
+
+        synced = a2a.sync_source_plan(
+            self.repo, self.working, self.state, dry_run=False, trace=self.trace
+        )
+
+        self.assertTrue(synced)
+        self.assertEqual(self.source.read_text(encoding="utf-8"), reviewed_plan)
+
+    def test_concurrent_source_and_working_edits_block_without_overwrite(self):
+        source_edit = "# Plan\n\nOperator edit.\n"
+        working_edit = "# Plan\n\nAgent edit.\n"
+        self.source.write_text(source_edit, encoding="utf-8")
+        self.working.write_text(working_edit, encoding="utf-8")
+
+        synced = a2a.sync_source_plan(
+            self.repo, self.working, self.state, dry_run=False, trace=self.trace
+        )
+
+        self.assertFalse(synced)
+        self.assertEqual(self.source.read_text(encoding="utf-8"), source_edit)
+        self.assertEqual(self.working.read_text(encoding="utf-8"), working_edit)
+        self.assertEqual(self.state.phase, "blocked")
+        self.assertIn("changed independently", self.state.blocked_reason)
+
+    def test_legacy_divergent_plans_block_instead_of_guessing(self):
+        self.state.source_plan_sha256 = ""
+        self.source.write_text("# Plan\n\nOperator edit.\n", encoding="utf-8")
+
+        synced = a2a.sync_source_plan(
+            self.repo, self.working, self.state, dry_run=False, trace=self.trace
+        )
+
+        self.assertFalse(synced)
+        self.assertEqual(self.state.phase, "blocked")
+
+    def test_legacy_equal_plans_bootstrap_digest(self):
+        self.state.source_plan_sha256 = ""
+
+        synced = a2a.sync_source_plan(
+            self.repo, self.working, self.state, dry_run=False, trace=self.trace
+        )
+
+        self.assertTrue(synced)
+        self.assertEqual(
+            self.state.source_plan_sha256,
+            a2a.plan_digest(self.source.read_text(encoding="utf-8")),
+        )
+
+
+class PlanNegotiationBlockingTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = pathlib.Path(self._tmp.name).resolve()
+        self.addCleanup(self._tmp.cleanup)
+        self.plan = self.repo / ".a2a" / "plans" / "test.plan.md"
+        self.plan.parent.mkdir(parents=True)
+        self.plan.write_text("# Plan\n\nTest.\n", encoding="utf-8")
+        self.log = self.repo / ".a2a" / "logs" / "test-run" / "run.log"
+        self.trace = a2a.WorkflowTrace(self.log)
+        self.state = StateRoundTripTests.make_state.__get__(self, type(self))()
+        self.state.repo = str(self.repo)
+        self.state.plan_path = ".a2a/plans/test.plan.md"
+        self.state.source_plan_path = None
+        self.state.log_path = str(self.log)
+        self.state.phase = "plan_written"
+        self.state.max_plan_rounds = 1
+
+    def implementer_review(self) -> str:
+        return (
+            f"{a2a.PLAN_APPEND_BEGIN}\n## Implementer Review\n\nAdd a test.\n"
+            f"{a2a.PLAN_APPEND_END}\n{a2a.DECISION_REASON_PREFIX} test added\n"
+            f"{a2a.PLAN_REVIEW_READY_TOKEN}\n"
+        )
+
+    def test_plan_round_exhaustion_creates_explicit_blocked_checkpoint(self):
+        reviewer = (
+            f"{a2a.PLAN_APPEND_BEGIN}\n## Reviewer Follow-up\n\nStill incomplete.\n"
+            f"{a2a.PLAN_APPEND_END}\n{a2a.DECISION_REASON_PREFIX} still incomplete\n"
+            f"{a2a.PLAN_CHANGES_TOKEN}\n"
+        )
+        with mock.patch.object(a2a, "run_agent", side_effect=[self.implementer_review(), reviewer]):
+            a2a.negotiate_plan(
+                self.repo, self.plan, False, self.log, self.trace, self.state, create_plan=False
+            )
+
+        self.assertEqual(self.state.phase, "blocked")
+        self.assertEqual(self.state.blocked_resume_phase, "plan_written")
+        self.assertIn("review budget exhausted", self.state.blocked_reason)
+        self.assertEqual(self.state.plan_review_round, 2)
+
+    def test_reviewer_can_block_immediately_for_operator_decision(self):
+        reviewer = (
+            f"{a2a.DECISION_REASON_PREFIX} operator must choose expiry bond routing\n"
+            f"{a2a.PLAN_BLOCKED_TOKEN}\n"
+        )
+        with mock.patch.object(a2a, "run_agent", side_effect=[self.implementer_review(), reviewer]) as agent:
+            a2a.negotiate_plan(
+                self.repo, self.plan, False, self.log, self.trace, self.state, create_plan=False
+            )
+
+        self.assertEqual(agent.call_count, 2)
+        self.assertEqual(self.state.phase, "blocked")
+        self.assertIn("expiry bond routing", self.state.blocked_reason)
+
+
+class ClaudeReviewerAllowlistTests(unittest.TestCase):
+    def test_review_phase_gets_narrow_allowlist(self):
+        tools = a2a.claude_allowed_tools("review local diff")
+        self.assertIn("Bash(git diff*)", tools)
+        self.assertIn("Bash(forge test*)", tools)
+        self.assertIn("Bash(gh pr list*)", tools)
+        self.assertNotIn("Bash", tools)
+        self.assertNotIn("Edit", tools)
+
+    def test_implementation_phase_gets_no_extra_tools(self):
+        self.assertEqual(a2a.claude_allowed_tools("implement approved plan"), ())
+
+
+class RawStepLogPathTests(unittest.TestCase):
+    def test_agent_transcript_is_separate_from_coordinator_log(self):
+        log = pathlib.Path("/repo/.a2a/logs/run/run.log")
+        path = a2a.raw_step_log_path(log, 3, "codex", "fix local review comments")
+        self.assertEqual(path, pathlib.Path("/repo/.a2a/logs/run/steps/step-03-codex-fix-local-review-comments.log"))
+
+
+class CodexHostPreflightTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.release_bin = self.root / "release" / "bin"
+        self.launcher_bin = self.root / "local" / "bin"
+        self.release_bin.mkdir(parents=True)
+        self.launcher_bin.mkdir(parents=True)
+        (self.release_bin / "codex").write_text("", encoding="utf-8")
+        (self.release_bin / "codex-code-mode-host").write_text("", encoding="utf-8")
+        (self.launcher_bin / "codex").symlink_to(self.release_bin / "codex")
+
+    def test_missing_sibling_alias_fails_before_agent_turn(self):
+        with mock.patch.object(a2a.shutil, "which", return_value=str(self.launcher_bin / "codex")):
+            with self.assertRaises(SystemExit):
+                a2a.codex_code_mode_host_status()
+
+    def test_missing_bundled_host_fails_before_agent_turn(self):
+        (self.release_bin / "codex-code-mode-host").unlink()
+        with mock.patch.object(a2a.shutil, "which", return_value=str(self.launcher_bin / "codex")):
+            with self.assertRaises(SystemExit):
+                a2a.codex_code_mode_host_status()
+
+    def test_present_sibling_alias_passes(self):
+        alias = self.launcher_bin / "codex-code-mode-host"
+        alias.symlink_to(self.release_bin / "codex-code-mode-host")
+        with mock.patch.object(a2a.shutil, "which", return_value=str(self.launcher_bin / "codex")):
+            self.assertEqual(a2a.codex_code_mode_host_status(), str(alias))
 
 
 class ExtractCloseoutTests(unittest.TestCase):

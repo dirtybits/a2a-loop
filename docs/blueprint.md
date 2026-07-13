@@ -11,10 +11,11 @@ coordinator may also assign any role to `claude` or `codex`.
 
 1. **Human supplies target goal.**
 2. **Claude plans.**
-   - Writes `.a2a/plans/<run-id>-<goal-slug>.plan.md`.
-   - Produces an implementation plan, acceptance criteria, and test expectations.
+   - Returns an implementation plan, acceptance criteria, and test expectations.
+   - The coordinator writes `.a2a/plans/<run-id>-<goal-slug>.plan.md`.
 3. **Codex reviews the plan.**
-   - Adds repo-specific fixes, risks, and test improvements to the plan.
+   - Returns an `A2A_PLAN_APPEND` delta with repo-specific fixes, risks, and test improvements.
+   - The coordinator appends the delta to the plan.
    - Does not implement yet.
 4. **Claude approves the enhanced plan.**
    - Emits `PLAN_STATUS: approved`, or adds follow-up plan changes.
@@ -22,15 +23,16 @@ coordinator may also assign any role to `claude` or `codex`.
    - Creates/uses a branch.
    - Makes code changes.
    - Runs tests.
-   - Commits locally.
+   - Ends with `IMPLEMENTATION_READY` or `IMPLEMENTATION_STATUS: blocked`.
+   - The coordinator commits only a ready result.
 6. **Claude reviews local diff.**
    - Reads `git diff <base>...HEAD`.
-   - Writes `.a2a/reviews/<run-id>/review-N.md`.
+   - Returns the review; the coordinator writes `.a2a/reviews/<run-id>/review-N.md`.
    - Emits a merge-clear decision or requests changes.
 7. **Codex fixes.**
    - Reads local review files.
    - Addresses comments.
-   - Commits locally.
+   - The coordinator commits only when the fixer reports ready and changed the worktree.
 8. **Loop repeats until clear.**
 9. **Coordinator pushes and opens/updates a PR.**
 10. **Coordinator squash-merges when requested.**
@@ -64,7 +66,9 @@ PLAN_REVIEW_READY
 PLAN_STATUS: approved
 PLAN_STATUS: changes_requested
 IMPLEMENTATION_READY
+IMPLEMENTATION_STATUS: blocked
 REVIEW_STATUS: changes_requested
+A2A_REASON: concise decision reason
 ```
 
 For the reviewer gate, require this exact line at the end of the reviewer's
@@ -76,6 +80,10 @@ MERGE_DECISION: APPROVE
 
 Anything else — including prose that merely mentions the token — keeps the
 loop alive or fails closed.
+
+The coordinator checkpoints a completed review before starting its fixer. A
+blocked or no-progress fixer does not consume another review round; the
+operator resolves the cause and explicitly resumes with `--retry-blocked`.
 
 ## Plan-as-Contract
 
@@ -111,4 +119,7 @@ body immutable for the run's lifetime.
 - Never auto-merge if tests failed.
 - Never auto-merge without the exact approval token.
 - Keep a full log directory per run.
+- Keep `run.log` concise and put full turn transcripts under `logs/<run-id>/steps/`.
+- Keep Claude review sessions on `dontAsk` with explicit read-only Git, PR
+  inspection, and repository-test allowlists rather than unrestricted Bash.
 - Let the coordinator run `gh pr merge --squash`, not the agents.

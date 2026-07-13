@@ -99,6 +99,10 @@ files under `.a2a/`:
 .a2a/
   plans/<run-id>-<goal-slug>.plan.md
   reviews/<run-id>/review-N.md
+  runs/<run-id>/state.json
+  runs/<run-id>/decisions.md
+  logs/<run-id>/run.log
+  logs/<run-id>/steps/step-NN-<agent>-<phase>.log
 ```
 
 Plans and reviews are namespaced by run id so concurrent or repeated runs with
@@ -108,14 +112,19 @@ At a high level:
 
 1. A human gives the loop a goal.
 2. Claude returns the plan in stdout; the coordinator persists `.a2a/plans/<run-id>-<goal-slug>.plan.md`.
-3. Codex reviews the plan in stdout; the coordinator persists the enhanced plan.
-4. Claude reviews the enhanced plan and may return coordinator-persisted follow-up changes.
-5. If Claude emits `PLAN_STATUS: approved`, Codex implements locally and the coordinator commits the resulting diff.
+3. Codex reviews the plan and returns only an `A2A_PLAN_APPEND` delta; the coordinator appends it.
+4. Claude reviews the enhanced plan and may return another coordinator-persisted append delta.
+5. If Claude emits `PLAN_STATUS: approved`, Codex implements locally. The coordinator commits only when the final line is exactly `IMPLEMENTATION_READY`.
 6. Claude reviews `git diff <base>...HEAD` in stdout; the coordinator persists it to `.a2a/reviews/<run-id>/review-N.md`.
 7. If Claude requests changes, Codex fixes them locally and the coordinator commits the resulting diff.
 8. The review/fix cycle repeats up to `--max-rounds`.
 9. If Claude emits `MERGE_DECISION: APPROVE`, the coordinator pushes and opens or updates a PR.
 10. If `--merge` was passed, the coordinator squash-merges the PR.
+
+An implementer or fixer can instead end with `IMPLEMENTATION_STATUS: blocked`.
+The coordinator checkpoints and prints the reason without committing or starting
+another review. A requested fix that produces no commit also stops as
+`blocked/no_progress` rather than buying another review of the same diff.
 
 If `--plan path/to/existing.plan.md` is passed, the coordinator skips initial
 plan creation and uses that file in place. It still runs implementer plan review
@@ -249,8 +258,8 @@ explicitly passed.
 The important prompt-building and execution functions are:
 
 - `build_plan_prompt(...)`: asks Claude to return a complete plan for coordinator persistence.
-- `build_plan_review_prompt(...)`: asks Codex to return an improved complete plan before implementation.
-- `build_plan_approval_prompt(...)`: asks Claude to approve or return a refined complete plan.
+- `build_plan_review_prompt(...)`: asks Codex to return an append-only plan delta before implementation.
+- `build_plan_approval_prompt(...)`: asks Claude to approve or return an append-only follow-up delta.
 - `codex_exec(...)`: runs Codex with workspace-write sandboxing and approval disabled.
 - `build_local_review_prompt(...)`: asks Claude to review the local diff in stdout so the coordinator can persist `.a2a/reviews/<run-id>/review-N.md`.
 - `build_local_fix_prompt(...)`: asks Codex to address local review feedback.
@@ -319,6 +328,17 @@ checks out the saved branch, appends to the original log, reuses the saved plan
 and role settings, and continues from the next incomplete phase. If the earlier
 run stopped after exhausting review rounds, `--max-rounds` on resume adds
 another bounded batch of rounds instead of restarting at `review-1.md`.
+Completed reviews are checkpointed before their fixer starts, so resuming a
+pending fix does not rerun the reviewer.
+For checkpoints created by older a2a-loop versions, resume also recognizes a
+persisted changes-requested review with no matching fix decision and migrates
+it to the pending-fix phase automatically.
+
+Blocked checkpoints do not retry implicitly. Resolve the reported blocker, then run:
+
+```bash
+a2a-loop --resume <run-id> --retry-blocked
+```
 
 Explicitly passed flags override the checkpoint on resume: `--planner`,
 `--implementer`, `--reviewer`, `--codex-model`, `--codex-effort`,
@@ -339,7 +359,8 @@ plain `--resume` keeps the run's original settings. If a saved run has
 - Passing `--branch` checks out an existing branch if present, or creates it if
   missing; it does not reset an existing branch.
 - Every run starts with a capability manifest trace: CLI availability, repo
-  writability, origin reachability, and both agents' auth status — so a run
+  writability, origin reachability, Codex code-mode host availability, and both
+  agents' auth status — so a run
   never discovers mid-turn that a dependency is missing. The implementer is
   also told to pre-classify plan verification steps as runnable or blocked up
   front instead of discovering them mid-run.
@@ -359,6 +380,11 @@ plain `--resume` keeps the run's original settings. If a saved run has
   deployment preview alone is never treated as CI evidence. Re-trigger
   skipped workflows by closing and reopening the PR.
 - The coordinator fails closed unless Claude emits `MERGE_DECISION: APPROVE`.
+- Implementation and fix turns fail closed unless their final line is exactly
+  `IMPLEMENTATION_READY` or `IMPLEMENTATION_STATUS: blocked`.
+- Claude review phases retain `dontAsk` and receive a narrow allowlist for
+  read-only Git/PR inspection and standard repository test commands. They do
+  not receive unrestricted Bash or edit tools.
 - Approval tokens must appear as an exact line at the end of the reviewer's
   output (a small trailing window tolerates CLI footers); reviewer prose that
   merely quotes a token is not an approval.
@@ -366,18 +392,20 @@ plain `--resume` keeps the run's original settings. If a saved run has
   PR, and merge actions.
 - Pass `--verbose` or set `A2A_VERBOSE=1` for a summarized live trace: public
   non-code agent text, tool calls, stderr, and a post-turn worktree diffstat.
-  Code snippets and raw tool output stay in the run log instead of the terminal.
+  Code snippets and raw tool output stay in the per-turn step logs instead of
+  the terminal or coordinator log.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the run
   ledger, and coordinator-persisted plan updates sync back to the source plan.
-- Logs are written to `.a2a/logs/<timestamp>/run.log` with the same status
-  breadcrumbs plus raw commands and agent output. Agent stdout streams into
-  the log as it arrives, so `tail -f` shows long turns live.
+- `.a2a/logs/<timestamp>/run.log` is the concise coordinator log. Full prompts,
+  JSON events, stdout, stderr, and tool output live in per-turn files under
+  `.a2a/logs/<timestamp>/steps/`, keeping the main log useful for `tail -f`.
 - Decision logs are written to `.a2a/runs/<run-id>/decisions.md` with concise
-  reviewer reasons, implementer responses, resolutions, and commit hashes.
+  `A2A_REASON:` values, resolutions, and commit hashes.
 - Local review stdout is persisted to `.a2a/reviews/<run-id>/review-N.md`;
   reviewers are not required to write review files directly.
-- Plan stdout and optional `A2A_PLAN_UPDATE` blocks are coordinator-persisted;
-  agents are not required to write `.a2a` plan files directly.
+- Initial plan stdout, negotiation `A2A_PLAN_APPEND` deltas, and implementation
+  `A2A_PLAN_UPDATE` blocks are coordinator-persisted; agents are not required
+  to write `.a2a` plan files directly.
 - Optional `A2A_COMMIT_MESSAGE` blocks let agents suggest a commit subject; the
   coordinator still creates the commit and falls back to a phase-derived message.
 - Fatal agent output, such as unsupported-model API errors, stops the loop
@@ -387,8 +415,8 @@ plain `--resume` keeps the run's original settings. If a saved run has
 
 ## Tests
 
-Unit tests cover the pure helpers (slug/effort normalization, token matching,
-gitignore management, state round-trips):
+Unit tests cover helper behavior plus blocker/no-progress control flow,
+pending-fix resume, reviewer permissions, plan deltas, and host preflight:
 
 ```bash
 python3 -m unittest discover tests

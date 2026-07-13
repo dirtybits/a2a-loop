@@ -52,9 +52,11 @@ Prefer the default local review mode. It saves tokens and avoids using GitHub
 comments as scratch space:
 
 - Claude returns the plan in stdout; the coordinator persists `.a2a/plans/<run-id>-<goal-slug>.plan.md`.
-- Codex returns the enhanced plan in stdout; the coordinator persists it.
-- Claude approves with `PLAN_STATUS: approved` or returns coordinator-persisted follow-up changes.
-- Codex implements locally; the coordinator commits the resulting diff.
+- Codex and Claude return only `A2A_PLAN_APPEND` deltas during plan negotiation;
+  the coordinator appends them without reprinting the full plan each round.
+- Claude approves with `PLAN_STATUS: approved` or returns a coordinator-persisted follow-up delta.
+- Codex implements locally; the coordinator commits only after an exact final
+  `IMPLEMENTATION_READY` line.
 - Claude reviews `git diff <base>...HEAD` in stdout; the coordinator persists `.a2a/reviews/<run-id>/review-N.md`.
 - Codex fixes locally until Claude emits `MERGE_DECISION: APPROVE`.
 - The coordinator commits fixes, then pushes and opens or updates the PR.
@@ -101,6 +103,10 @@ auth status:` from `claude auth status --json` at startup when applicable.
   without resetting it.
 - Keep legacy `a2a-logs/` ignored for runs created by older coordinator versions.
 - Keep `--max-plan-rounds` and `--max-rounds` bounded.
+- Treat `IMPLEMENTATION_STATUS: blocked` as a hard stop: the coordinator must
+  checkpoint, surface `A2A_REASON:`, and never commit or start review.
+- If a requested fix creates no commit, stop as blocked/no-progress instead of
+  reviewing the unchanged diff again.
 - Prefer a clean branch or disposable worktree for target projects.
 - New branches start from `origin/<base>`; agent PRs are never stacked on
   unmerged work.
@@ -120,21 +126,31 @@ auth status:` from `claude auth status --json` at startup when applicable.
   approval, PR, and merge status.
 - Use `--verbose` or `A2A_VERBOSE=1` when the operator wants a summarized live
   trace of public non-code agent text, tool calls, stderr, and post-turn
-  diffstats. Code snippets and raw tool output stay in the run log.
+  diffstats. Full per-turn output stays under `.a2a/logs/<run-id>/steps/`.
+- Claude reviewer turns use `dontAsk` with a narrow allowlist for read-only Git,
+  PR inspection, and standard test runners, never unrestricted Bash.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the run
   ledger, and coordinator-persisted plan updates sync back to the source plan.
-- Inspect `.a2a/logs/<timestamp>/run.log`, `.a2a/runs/<run-id>/decisions.md`,
+- Inspect the concise `.a2a/logs/<timestamp>/run.log`, raw
+  `.a2a/logs/<timestamp>/steps/`, `.a2a/runs/<run-id>/decisions.md`,
   `.a2a/plans/`, and `.a2a/reviews/` when debugging a run.
 - Local review stdout is persisted to `.a2a/reviews/<run-id>/review-N.md`;
   reviewers are not required to write review files directly.
-- Plan stdout and optional `A2A_PLAN_UPDATE` blocks are coordinator-persisted;
-  agents are not required to write `.a2a` plan files directly.
+- Initial plan stdout, negotiation `A2A_PLAN_APPEND` deltas, and implementation
+  `A2A_PLAN_UPDATE` blocks are coordinator-persisted; agents are not required
+  to write `.a2a` plan files directly.
 - Optional `A2A_COMMIT_MESSAGE` blocks let agents suggest a commit subject; the
   coordinator still creates the commit and falls back to a phase-derived message.
 - Real runs checkpoint to `.a2a/runs/<run-id>/state.json`; use
   `a2a-loop --resume <run-id>` to continue from the next incomplete phase.
   Use bare `a2a-loop --resume` to resume the newest checkpoint under
   `.a2a/runs/`, equivalent to picking the latest `ls -td .a2a/runs/* | head`.
+- Reviews are checkpointed before the fixer starts. A blocked checkpoint does
+  not rerun implicitly; after resolving the blocker, use
+  `a2a-loop --resume <run-id> --retry-blocked`.
+- Older checkpoints with a persisted changes-requested review and no recorded
+  fix are migrated to the pending-fix phase on resume, avoiding a duplicate
+  reviewer turn.
 - On resume, `--max-plan-rounds` and `--max-rounds` add another bounded batch
   from the saved next round. Explicitly passed role/model/effort flags
   override the checkpoint and are echoed as `resume override:` trace lines.

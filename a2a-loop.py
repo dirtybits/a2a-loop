@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import pathlib
@@ -34,6 +35,7 @@ APPROVAL_TOKEN = "MERGE_DECISION: APPROVE"
 PLAN_READY_TOKEN = "PLAN_READY"
 PLAN_REVIEW_READY_TOKEN = "PLAN_REVIEW_READY"
 PLAN_APPROVAL_TOKEN = "PLAN_STATUS: approved"
+PLAN_BLOCKED_TOKEN = "PLAN_STATUS: blocked"
 # The loop only ever checks for the approval tokens. Any other reviewer
 # output, including these changes-requested tokens, fails closed into
 # another review round; the tokens exist so prompts can name an explicit
@@ -42,8 +44,13 @@ PLAN_CHANGES_TOKEN = "PLAN_STATUS: changes_requested"
 REVIEW_CHANGES_TOKEN = "REVIEW_STATUS: changes_requested"
 PLAN_UPDATE_BEGIN = "A2A_PLAN_UPDATE_BEGIN"
 PLAN_UPDATE_END = "A2A_PLAN_UPDATE_END"
+PLAN_APPEND_BEGIN = "A2A_PLAN_APPEND_BEGIN"
+PLAN_APPEND_END = "A2A_PLAN_APPEND_END"
 COMMIT_MESSAGE_BEGIN = "A2A_COMMIT_MESSAGE_BEGIN"
 COMMIT_MESSAGE_END = "A2A_COMMIT_MESSAGE_END"
+DECISION_REASON_PREFIX = "A2A_REASON:"
+IMPLEMENTATION_READY_TOKEN = "IMPLEMENTATION_READY"
+IMPLEMENTATION_BLOCKED_TOKEN = "IMPLEMENTATION_STATUS: blocked"
 LATEST_RESUME = "__latest__"
 AGENTS = ("claude", "codex")
 STATE_VERSION = 1
@@ -92,6 +99,38 @@ CONVENTION_FILES = (
     ".github/copilot-instructions.md",
 )
 VERBOSE_LINE_LIMIT = 240
+CLAUDE_REVIEW_ALLOWED_TOOLS = (
+    "Read",
+    "Glob",
+    "Grep",
+    "Bash(git status*)",
+    "Bash(git log*)",
+    "Bash(git diff*)",
+    "Bash(git show*)",
+    "Bash(git branch*)",
+    "Bash(git rev-parse*)",
+    "Bash(git merge-base*)",
+    "Bash(git ls-files*)",
+    "Bash(forge test*)",
+    "Bash(forge build*)",
+    "Bash(npm run *)",
+    "Bash(npm test*)",
+    "Bash(pnpm *)",
+    "Bash(bun *)",
+    "Bash(yarn *)",
+    "Bash(cargo test*)",
+    "Bash(go test*)",
+    "Bash(pytest *)",
+    "Bash(python* -m pytest*)",
+    "Bash(gh pr list*)",
+    "Bash(gh pr view*)",
+    "Bash(gh pr checks*)",
+)
+CLAUDE_REVIEW_PHASES = {
+    "approve plan",
+    "review local diff",
+    "review GitHub PR",
+}
 
 
 def warn(message: str) -> None:
@@ -391,6 +430,11 @@ class RunState:
     approved: bool = False
     verbose: bool = False
     final_review_path: str = ""
+    blocked_reason: str = ""
+    blocked_resume_phase: str = ""
+    pending_review_path: str = ""
+    pending_review_round: int = 0
+    source_plan_sha256: str = ""
 
 
 def state_path(repo: pathlib.Path, run_id: str) -> pathlib.Path:
@@ -453,9 +497,40 @@ def load_state(path: pathlib.Path) -> RunState:
     data.setdefault("claude_effort_source", "legacy checkpoint")
     data.setdefault("verbose", False)
     data.setdefault("final_review_path", "")
+    data.setdefault("blocked_reason", "")
+    data.setdefault("blocked_resume_phase", "")
+    data.setdefault("pending_review_path", "")
+    data.setdefault("pending_review_round", 0)
+    data.setdefault("source_plan_sha256", "")
     repo = pathlib.Path(data.get("repo") or path.parents[3]).expanduser()
     data.setdefault("decision_log_path", str(decision_log_path(repo, data["run_id"]).relative_to(repo)))
     return RunState(**data)
+
+
+def migrate_legacy_pending_fix(repo: pathlib.Path, state: RunState) -> str | None:
+    """Recover reviews persisted before pending-fix checkpoints were added."""
+    if (
+        state.gh_review
+        or state.phase != "implementation_ready"
+        or state.pending_review_path
+        or state.local_review_round < 1
+    ):
+        return None
+    round_index = state.local_review_round
+    review_path = repo / ".a2a" / "reviews" / state.run_id / f"review-{round_index}.md"
+    review = read_if_present(review_path)
+    if not ends_with_token(review, REVIEW_CHANGES_TOKEN):
+        return None
+    decisions = read_if_present(resolve_repo_path(repo, pathlib.Path(state.decision_log_path)))
+    review_heading = f"## Local review round {round_index}: changes requested"
+    fix_heading = f"## Local fix round {round_index}: implemented"
+    if review_heading not in decisions or fix_heading in decisions:
+        return None
+    review_rel = repo_relative(repo, review_path)
+    state.phase = "local_fix_pending"
+    state.pending_review_path = review_rel
+    state.pending_review_round = round_index
+    return review_rel
 
 
 def summarize_agent_output(output: str, max_len: int = 220) -> str:
@@ -464,20 +539,54 @@ def summarize_agent_output(output: str, max_len: int = 220) -> str:
         PLAN_READY_TOKEN,
         PLAN_REVIEW_READY_TOKEN,
         PLAN_APPROVAL_TOKEN,
+        PLAN_BLOCKED_TOKEN,
         PLAN_CHANGES_TOKEN,
         REVIEW_CHANGES_TOKEN,
-        "IMPLEMENTATION_READY",
+        IMPLEMENTATION_READY_TOKEN,
+        IMPLEMENTATION_BLOCKED_TOKEN,
     }
     for raw_line in output.splitlines():
         line = compact_line(raw_line, max_len)
         if not line or line in skip_tokens:
             continue
-        if line in {PLAN_UPDATE_BEGIN, PLAN_UPDATE_END, COMMIT_MESSAGE_BEGIN, COMMIT_MESSAGE_END}:
+        if line.startswith(DECISION_REASON_PREFIX):
+            continue
+        if line in {
+            PLAN_UPDATE_BEGIN,
+            PLAN_UPDATE_END,
+            PLAN_APPEND_BEGIN,
+            PLAN_APPEND_END,
+            COMMIT_MESSAGE_BEGIN,
+            COMMIT_MESSAGE_END,
+        }:
             continue
         if is_code_like_verbose_line(line):
             continue
         return line
     return "No short reason captured; see run log for full output."
+
+
+def extract_decision_reason(output: str, max_len: int = 220) -> str | None:
+    for raw_line in reversed(output.splitlines()):
+        line = raw_line.strip()
+        if not line.startswith(DECISION_REASON_PREFIX):
+            continue
+        reason = compact_line(line[len(DECISION_REASON_PREFIX) :], max_len)
+        return reason or None
+    return None
+
+
+def decision_reason(output: str) -> str:
+    return extract_decision_reason(output) or summarize_agent_output(output)
+
+
+def implementation_status(output: str) -> str:
+    final_line = next((line.strip() for line in reversed(output.splitlines()) if line.strip()), "")
+    if final_line == IMPLEMENTATION_READY_TOKEN:
+        return "ready"
+    if final_line == IMPLEMENTATION_BLOCKED_TOKEN:
+        return "blocked"
+    return "missing"
 
 
 def append_decision(
@@ -515,6 +624,48 @@ def append_decision(
         f.write("\n".join(lines))
         f.write("\n")
     trace.event(f"decision log appended: {repo_relative(repo, path)}")
+
+
+def mark_run_blocked(
+    repo: pathlib.Path,
+    state: RunState,
+    dry_run: bool,
+    trace: WorkflowTrace,
+    context: str,
+    reason: str,
+    resume_phase: str,
+) -> None:
+    state.phase = "blocked"
+    state.blocked_reason = reason
+    state.blocked_resume_phase = resume_phase
+    append_decision(
+        repo,
+        state,
+        dry_run,
+        trace,
+        f"{context}: blocked",
+        [
+            ("Reason", reason),
+            ("Resume phase", resume_phase),
+        ],
+    )
+    save_state(repo, state, dry_run, trace)
+    trace.event(f"blocked: {reason}")
+    trace.event(
+        "resolve the blocker, then retry with: "
+        f"a2a-loop --resume {state.run_id} --retry-blocked"
+    )
+
+
+def blocked_exit(state: RunState, log: pathlib.Path, trace: WorkflowTrace) -> int:
+    if state.blocked_reason:
+        trace.event(f"run remains blocked: {state.blocked_reason}")
+    trace.event(
+        "retry only after resolving it: "
+        f"a2a-loop --resume {state.run_id} --retry-blocked"
+    )
+    trace.event(f"logs: {log}")
+    return 3
 
 
 def run(
@@ -867,6 +1018,12 @@ def claude_env(use_api_key: bool) -> dict[str, str] | None:
     return env
 
 
+def claude_allowed_tools(phase: str) -> tuple[str, ...]:
+    if phase in CLAUDE_REVIEW_PHASES:
+        return CLAUDE_REVIEW_ALLOWED_TOOLS
+    return ()
+
+
 def claude_print(
     prompt: str,
     repo: pathlib.Path,
@@ -876,6 +1033,7 @@ def claude_print(
     effort: str | None,
     use_api_key: bool,
     verbose: bool = False,
+    phase: str = "",
 ) -> str:
     args = [
         "claude",
@@ -885,6 +1043,9 @@ def claude_print(
         "--output-format",
         "stream-json" if verbose else "text",
     ]
+    allowed_tools = claude_allowed_tools(phase)
+    if allowed_tools:
+        args.extend(["--allowedTools", *allowed_tools])
     if verbose:
         args.append("--verbose")
     if model:
@@ -954,6 +1115,11 @@ def codex_exec(
     return result.stdout
 
 
+def raw_step_log_path(log: pathlib.Path, step: int, agent: str, phase: str) -> pathlib.Path:
+    phase_slug = slugify_goal(phase)[:40]
+    return log.parent / "steps" / f"step-{step:02d}-{agent}-{phase_slug}.log"
+
+
 def run_agent(
     agent: str,
     phase: str,
@@ -969,28 +1135,33 @@ def run_agent(
         model = state.claude_display_model
         effort = state.claude_display_effort
         step = trace.start_agent(agent, phase, model, effort, artifact)
+        agent_log = raw_step_log_path(log, step, agent, phase)
         output = claude_print(
             prompt,
             repo,
             dry_run,
-            log,
+            agent_log,
             state.claude_model,
             state.claude_effort,
             state.claude_use_api_key,
             state.verbose,
+            phase,
         )
         if state.verbose:
             emit_verbose_worktree_summary(agent, repo, dry_run, log)
         trace.finish_agent(agent, step, phase, model, effort, output)
+        trace.event(f"step {step} raw transcript: {display_path(repo, agent_log)}")
         return output
     if agent == "codex":
         model = state.codex_display_model
         effort = state.codex_display_effort
         step = trace.start_agent(agent, phase, model, effort, artifact)
-        output = codex_exec(prompt, repo, dry_run, log, state.codex_model, state.codex_effort, state.verbose)
+        agent_log = raw_step_log_path(log, step, agent, phase)
+        output = codex_exec(prompt, repo, dry_run, agent_log, state.codex_model, state.codex_effort, state.verbose)
         if state.verbose:
             emit_verbose_worktree_summary(agent, repo, dry_run, log)
         trace.finish_agent(agent, step, phase, model, effort, output)
+        trace.event(f"step {step} raw transcript: {display_path(repo, agent_log)}")
         return output
     raise ValueError(f"Unsupported agent: {agent}")
 
@@ -1048,6 +1219,27 @@ def ensure_branch(
     require_ok(result, "branch setup")
 
 
+def codex_code_mode_host_status() -> str | None:
+    codex_command = shutil.which("codex")
+    if not codex_command:
+        return None
+    launcher = pathlib.Path(codex_command)
+    bundled_host = launcher.resolve().parent / "codex-code-mode-host"
+    if not bundled_host.exists():
+        raise SystemExit(
+            "Codex code-mode host is missing from the installed CLI: "
+            f"{bundled_host}\nRepair or update the Codex installation before starting an agent turn."
+        )
+    expected_host = launcher.parent / "codex-code-mode-host"
+    if not expected_host.exists():
+        raise SystemExit(
+            "Codex code-mode host alias is missing: "
+            f"{expected_host}\nThe bundled host exists at: {bundled_host}\n"
+            "Repair the Codex installation or create the sibling alias before starting an agent turn."
+        )
+    return str(expected_host)
+
+
 def trace_capability_manifest(
     repo: pathlib.Path,
     dry_run: bool,
@@ -1062,6 +1254,9 @@ def trace_capability_manifest(
     )
     trace.event(f"capabilities: CLIs: {clis}")
     trace.event(f"capabilities: repo writable: {'yes' if os.access(repo, os.W_OK) else 'NO'}")
+    host = codex_code_mode_host_status()
+    if host:
+        trace.event(f"capabilities: Codex code-mode host: {host}")
     if dry_run:
         trace.event("capabilities: origin remote: not probed in dry-run")
         return
@@ -1132,7 +1327,8 @@ def trace_run_defaults(repo: pathlib.Path, plan_path: pathlib.Path, state: RunSt
         f"plan={display_path(repo, plan_path)}, "
         f"state={display_path(repo, state_path(repo, state.run_id))}, "
         f"decisions={display_path(repo, resolve_repo_path(repo, pathlib.Path(state.decision_log_path)))}, "
-        f"log={display_path(repo, pathlib.Path(state.log_path))}"
+        f"log={display_path(repo, pathlib.Path(state.log_path))}, "
+        f"raw-steps={display_path(repo, pathlib.Path(state.log_path).parent / 'steps')}"
     )
     if state.source_plan_path and state.source_plan_path != state.plan_path:
         trace.event(f"plan ledger source: {state.source_plan_path}")
@@ -1140,6 +1336,10 @@ def trace_run_defaults(repo: pathlib.Path, plan_path: pathlib.Path, state: RunSt
 
 def plan_is_in_a2a(repo: pathlib.Path, path: pathlib.Path) -> bool:
     return display_path(repo, path).startswith(".a2a/")
+
+
+def plan_digest(contents: str) -> str:
+    return hashlib.sha256(contents.encode("utf-8")).hexdigest()
 
 
 def materialize_working_plan(
@@ -1173,25 +1373,70 @@ def sync_source_plan(
     state: RunState,
     dry_run: bool,
     trace: WorkflowTrace,
-) -> None:
+) -> bool:
     if not state.source_plan_path or state.source_plan_path == state.plan_path:
-        return
+        return True
     source_path = resolve_repo_path(repo, pathlib.Path(state.source_plan_path))
     if dry_run:
         trace.event(
             f"dry-run would sync plan ledger back to source: "
             f"{display_path(repo, working_plan_path)} -> {display_path(repo, source_path)}"
         )
-        return
-    if not working_plan_path.exists():
-        trace.event(f"plan ledger missing; source sync skipped: {display_path(repo, working_plan_path)}")
-        return
+        return True
+    if not working_plan_path.exists() or not source_path.exists():
+        missing = working_plan_path if not working_plan_path.exists() else source_path
+        mark_run_blocked(
+            repo,
+            state,
+            dry_run,
+            trace,
+            "Plan synchronization",
+            f"plan synchronization cannot continue because {display_path(repo, missing)} is missing",
+            "plan_written",
+        )
+        return False
     working = working_plan_path.read_text(encoding="utf-8")
-    existing = source_path.read_text(encoding="utf-8") if source_path.exists() else ""
+    existing = source_path.read_text(encoding="utf-8")
+    working_sha256 = plan_digest(working)
+    source_sha256 = plan_digest(existing)
     if working == existing:
-        return
-    source_path.write_text(working, encoding="utf-8")
-    trace.event(f"synced plan ledger back to source: {display_path(repo, source_path)}")
+        state.source_plan_sha256 = source_sha256
+        return True
+    last_synced = state.source_plan_sha256
+    if not last_synced:
+        mark_run_blocked(
+            repo,
+            state,
+            dry_run,
+            trace,
+            "Plan synchronization",
+            "legacy checkpoint has divergent source and working plans; reconcile them manually before retrying",
+            "plan_written",
+        )
+        return False
+    if source_sha256 == last_synced:
+        source_path.write_text(working, encoding="utf-8")
+        state.source_plan_sha256 = working_sha256
+        trace.event(f"synced plan ledger back to source: {display_path(repo, source_path)}")
+        return True
+    if working_sha256 == last_synced:
+        working_plan_path.write_text(existing, encoding="utf-8")
+        state.source_plan_sha256 = source_sha256
+        trace.event(
+            f"imported operator source-plan changes into run ledger: "
+            f"{display_path(repo, working_plan_path)}"
+        )
+        return True
+    mark_run_blocked(
+        repo,
+        state,
+        dry_run,
+        trace,
+        "Plan synchronization",
+        "canonical source plan and run ledger changed independently; reconcile both copies manually",
+        "plan_written",
+    )
+    return False
 
 
 def ensure_a2a_dirs(repo: pathlib.Path, dry_run: bool) -> None:
@@ -1339,8 +1584,12 @@ def persist_review_output(path: pathlib.Path, output: str, dry_run: bool, trace:
 
 def strip_artifact_tokens(output: str, tokens: set[str]) -> str:
     lines = output.strip().splitlines()
-    while lines and lines[-1].strip() in tokens:
-        lines.pop()
+    while lines:
+        tail = lines[-1].strip()
+        if tail in tokens or tail.startswith(DECISION_REASON_PREFIX):
+            lines.pop()
+            continue
+        break
     return "\n".join(lines).strip()
 
 
@@ -1384,6 +1633,50 @@ def extract_sentinel_block(output: str, begin: str, end: str) -> str | None:
 
 def extract_plan_update(output: str) -> str | None:
     return extract_sentinel_block(output, PLAN_UPDATE_BEGIN, PLAN_UPDATE_END)
+
+
+def extract_plan_append(output: str) -> str | None:
+    return extract_sentinel_block(output, PLAN_APPEND_BEGIN, PLAN_APPEND_END)
+
+
+def persist_plan_append_block(
+    path: pathlib.Path,
+    output: str,
+    dry_run: bool,
+    trace: WorkflowTrace,
+    reason: str,
+) -> bool:
+    addition = extract_plan_append(output)
+    if addition is None:
+        return False
+    first_line = next((line.strip() for line in addition.splitlines() if line.strip()), "")
+    if not first_line.startswith("#"):
+        raise SystemExit(f"Plan append rejected ({reason}): appended markdown must begin with a heading.")
+    if dry_run:
+        trace.event(f"dry-run would append plan delta ({reason}): {path.name}")
+        return True
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if addition.strip() in existing:
+        trace.event(f"plan delta already present after {reason}: {path.name}")
+        return False
+    separator = "\n\n" if existing.strip() else ""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(existing.rstrip() + separator + addition.rstrip() + "\n", encoding="utf-8")
+    trace.event(f"appended plan delta ({reason}): {path.name}")
+    return True
+
+
+def persist_plan_revision(
+    path: pathlib.Path,
+    output: str,
+    dry_run: bool,
+    trace: WorkflowTrace,
+    reason: str,
+    tokens: set[str],
+) -> bool:
+    if extract_plan_append(output) is not None:
+        return persist_plan_append_block(path, output, dry_run, trace, reason)
+    return persist_plan_markdown(path, output, dry_run, trace, reason, tokens)
 
 
 def persist_plan_update_block(
@@ -1622,15 +1915,18 @@ Base branch: {base}
 {plan_path}
 
 Inspect the repo enough to catch missing steps, risky assumptions, weak tests,
-or repo-specific implementation details. Return the complete updated plan
-markdown in stdout, adding an "Implementer Review" or "Implementation
-Enhancements" section. Preserve the plan-writing frontmatter shape and keep
-todo ids stable.
+or repo-specific implementation details. Return only a new "Implementer
+Review" or "Implementation Enhancements" section between:
+{PLAN_APPEND_BEGIN}
+...append-only markdown beginning with a heading...
+{PLAN_APPEND_END}
+Do not repeat the existing plan or its frontmatter.
 
 The plan body is append-only: add sections and notes, but never delete or
 rewrite existing sections or drop SEQUENCING/DECISION callouts — the
 coordinator rejects updates that delete sections.
-Do not include commentary outside the plan markdown except the final {PLAN_REVIEW_READY_TOKEN} line.
+Immediately before the final token, include one concise line beginning
+`{DECISION_REASON_PREFIX}` that summarizes what the review added.
 
 Do not write plan files yourself. Do not implement the feature yet. End your response with {PLAN_REVIEW_READY_TOKEN}.
 """.strip()
@@ -1651,12 +1947,23 @@ Read and review the enhanced plan at:
 If the plan is ready for implementation, end with exactly:
 {PLAN_APPROVAL_TOKEN}
 
-If changes are still needed, return the complete updated plan markdown in stdout
-with a concise "Reviewer Follow-up" section and end with exactly:
+If changes are still needed, return only a concise "Reviewer Follow-up"
+section between:
+{PLAN_APPEND_BEGIN}
+...append-only markdown beginning with a heading...
+{PLAN_APPEND_END}
+and end with exactly:
 {PLAN_CHANGES_TOKEN}
-Do not include commentary outside the plan markdown when returning changes.
 The plan body is append-only: add your follow-up section, but never delete or
 rewrite existing sections or drop SEQUENCING/DECISION callouts.
+
+If implementation is blocked on a human-only choice, external authority, or
+other condition that another autonomous plan-review round cannot resolve, do
+not append another follow-up. Explain the blocker, then end with exactly:
+{PLAN_BLOCKED_TOKEN}
+
+Immediately before either final status token, include one concise line
+beginning `{DECISION_REASON_PREFIX}` explaining the decision.
 
 Do not write plan files yourself. Do not implement the feature.
 """.strip()
@@ -1717,7 +2024,12 @@ Plan file:
 - Do not write `.a2a` plan/review files yourself.
 - Do not push.
 - Do not merge.
-- End your final response with IMPLEMENTATION_READY or explain the blocker.
+- Immediately before the final status token, include one concise line
+  beginning `{DECISION_REASON_PREFIX}` summarizing completion or the blocker.
+- End with exactly `{IMPLEMENTATION_READY_TOKEN}` only when implementation is
+  ready to commit and review.
+- If any hard constraint or required operator decision blocks completion, do
+  not claim readiness; end with exactly `{IMPLEMENTATION_BLOCKED_TOKEN}`.
 
 Base branch: {base}
 """.strip()
@@ -1751,12 +2063,18 @@ Review duties beyond the diff itself:
   such.
 - Verify claimed test results are plausible for this worktree and diff;
   re-run cheap checks yourself when in doubt.
+- Run allowed verification commands directly, without shell setup prefixes,
+  command chaining, pipes, or output redirection; the coordinator grants a
+  narrow non-interactive allowlist for read-only Git, standard test runners,
+  and PR inspection.
 - If other open PRs touch the same subsystem, state the required merge order
   and semantic-conflict risks. Never call this change independent of them
   unless the combination was actually tested.
 
 If changes are needed:
 - Include actionable findings in your stdout review.
+- Immediately before the final token, include one concise line beginning
+  `{DECISION_REASON_PREFIX}` explaining the most important reason.
 - End your response with exactly:
 {REVIEW_CHANGES_TOKEN}
 
@@ -1766,6 +2084,8 @@ If the implementation satisfies the goal and tests are adequate:
   reviewer: the riskiest hunks, the invariants to verify, what to try to
   break, and what earlier internal review rounds already caught and fixed
   (so it is not re-litigated). This section is copied into the PR body.
+- Immediately before the final token, include one concise line beginning
+  `{DECISION_REASON_PREFIX}` explaining why the change is ready.
 - End your response with exactly:
 {APPROVAL_TOKEN}
 
@@ -1821,7 +2141,12 @@ Review file:
 - Do not write `.a2a` plan/review files yourself.
 - Do not push.
 - Do not merge.
-- End with IMPLEMENTATION_READY or explain the blocker.
+- Immediately before the final status token, include one concise line
+  beginning `{DECISION_REASON_PREFIX}` summarizing completion or the blocker.
+- End with exactly `{IMPLEMENTATION_READY_TOKEN}` only when the requested
+  fixes produced reviewable progress.
+- If a hard constraint or operator decision prevents progress, end with
+  exactly `{IMPLEMENTATION_BLOCKED_TOKEN}`.
 """.strip()
 
 
@@ -1848,9 +2173,13 @@ Review duties beyond the diff itself:
 
 If changes are needed:
 - Leave actionable PR comments or a clear review summary.
-- End with REVIEW_STATUS: changes_requested.
+- Immediately before the final token, include one concise line beginning
+  `{DECISION_REASON_PREFIX}` explaining the most important reason.
+- End with {REVIEW_CHANGES_TOKEN}.
 
 If the PR satisfies the goal and tests are adequate:
+- Immediately before the final token, include one concise line beginning
+  `{DECISION_REASON_PREFIX}` explaining why the PR is ready.
 - End with exactly:
 {APPROVAL_TOKEN}
 
@@ -1892,7 +2221,12 @@ Reviewer output:
 - Do not write to `.git`.
 - Do not write `.a2a` plan/review files yourself.
 - Do not merge.
-- End with IMPLEMENTATION_READY or explain the blocker.
+- Immediately before the final status token, include one concise line
+  beginning `{DECISION_REASON_PREFIX}` summarizing completion or the blocker.
+- End with exactly `{IMPLEMENTATION_READY_TOKEN}` only when the requested
+  fixes produced reviewable progress.
+- If a hard constraint or operator decision prevents progress, end with
+  exactly `{IMPLEMENTATION_BLOCKED_TOKEN}`.
 """.strip()
 
 
@@ -1928,7 +2262,8 @@ def negotiate_plan(
                 "planner stdout",
                 tokens={PLAN_READY_TOKEN},
             )
-            sync_source_plan(repo, plan_path, state, dry_run, trace)
+            if not sync_source_plan(repo, plan_path, state, dry_run, trace):
+                return read_if_present(plan_path, "DRY_RUN_PLAN")
         else:
             trace.event(f"using existing plan: {plan_rel}")
         state.phase = "plan_written"
@@ -1939,6 +2274,9 @@ def negotiate_plan(
         trace.event(f"plan already ready: {plan_rel}")
 
     if state.phase != "plan_written":
+        return read_if_present(plan_path, "DRY_RUN_PLAN")
+
+    if not sync_source_plan(repo, plan_path, state, dry_run, trace):
         return read_if_present(plan_path, "DRY_RUN_PLAN")
 
     if state.skip_plan_review:
@@ -1960,7 +2298,25 @@ def negotiate_plan(
             state,
             artifact=plan_rel,
         )
-        persist_plan_markdown(
+        if dry_run:
+            review_output = (
+                f"{PLAN_APPEND_BEGIN}\n## Dry-run plan review\n\nNo changes persisted.\n"
+                f"{PLAN_APPEND_END}\n{DECISION_REASON_PREFIX} dry-run plan review\n"
+                f"{PLAN_REVIEW_READY_TOKEN}"
+            )
+        review_reason = extract_decision_reason(review_output)
+        if not ends_with_token(review_output, PLAN_REVIEW_READY_TOKEN) or not review_reason:
+            mark_run_blocked(
+                repo,
+                state,
+                dry_run,
+                trace,
+                f"Plan round {round_index}: implementer review",
+                "plan review omitted the required status token or A2A_REASON line",
+                "plan_written",
+            )
+            return read_if_present(plan_path, "DRY_RUN_PLAN")
+        persist_plan_revision(
             plan_path,
             review_output,
             dry_run,
@@ -1968,7 +2324,8 @@ def negotiate_plan(
             "implementer plan review stdout",
             tokens={PLAN_REVIEW_READY_TOKEN},
         )
-        sync_source_plan(repo, plan_path, state, dry_run, trace)
+        if not sync_source_plan(repo, plan_path, state, dry_run, trace):
+            return read_if_present(plan_path, "DRY_RUN_PLAN")
         approval = run_agent(
             state.reviewer,
             "approve plan",
@@ -1980,9 +2337,33 @@ def negotiate_plan(
             state,
             artifact=plan_rel,
         )
-        sync_source_plan(repo, plan_path, state, dry_run, trace)
+        if not sync_source_plan(repo, plan_path, state, dry_run, trace):
+            return read_if_present(plan_path, "DRY_RUN_PLAN")
         if dry_run:
-            approval = PLAN_APPROVAL_TOKEN
+            approval = f"{DECISION_REASON_PREFIX} dry-run approval\n{PLAN_APPROVAL_TOKEN}"
+        approval_reason = extract_decision_reason(approval)
+        if not approval_reason:
+            mark_run_blocked(
+                repo,
+                state,
+                dry_run,
+                trace,
+                f"Plan round {round_index}: reviewer decision",
+                "reviewer response omitted the required A2A_REASON line",
+                "plan_written",
+            )
+            return read_if_present(plan_path, "DRY_RUN_PLAN")
+        if ends_with_token(approval, PLAN_BLOCKED_TOKEN):
+            mark_run_blocked(
+                repo,
+                state,
+                dry_run,
+                trace,
+                f"Plan round {round_index}: reviewer decision",
+                approval_reason,
+                "plan_written",
+            )
+            return read_if_present(plan_path, "DRY_RUN_PLAN")
         if ends_with_token(approval, PLAN_APPROVAL_TOKEN):
             append_decision(
                 repo,
@@ -1992,7 +2373,7 @@ def negotiate_plan(
                 f"Plan round {round_index}: approved",
                 [
                     ("Reviewer", state.reviewer),
-                    ("Reason", summarize_agent_output(approval)),
+                    ("Reason", approval_reason),
                     ("Plan", plan_rel),
                 ],
             )
@@ -2008,12 +2389,12 @@ def negotiate_plan(
                 f"Plan round {round_index}: changes requested",
                 [
                     ("Reviewer", state.reviewer),
-                    ("Reason", summarize_agent_output(approval)),
+                    ("Reason", approval_reason),
                     ("Implementer", state.implementer),
                     ("Plan", plan_rel),
                 ],
             )
-            persist_plan_markdown(
+            persist_plan_revision(
                 plan_path,
                 approval,
                 dry_run,
@@ -2021,14 +2402,32 @@ def negotiate_plan(
                 "reviewer plan follow-up stdout",
                 tokens={PLAN_CHANGES_TOKEN},
             )
-            sync_source_plan(repo, plan_path, state, dry_run, trace)
+            if not sync_source_plan(repo, plan_path, state, dry_run, trace):
+                return read_if_present(plan_path, "DRY_RUN_PLAN")
+        elif not ends_with_token(approval, PLAN_CHANGES_TOKEN):
+            mark_run_blocked(
+                repo,
+                state,
+                dry_run,
+                trace,
+                f"Plan round {round_index}: reviewer decision",
+                "reviewer response omitted the required approval or changes-requested token",
+                "plan_written",
+            )
+            return read_if_present(plan_path, "DRY_RUN_PLAN")
         state.plan_review_round = round_index + 1
         save_state(repo, state, dry_run, trace)
 
-    raise SystemExit(
-        f"Plan was not approved within {state.max_plan_rounds} rounds. "
-        f"Resume with more rounds: a2a-loop --resume {state.run_id} --max-plan-rounds 2"
+    mark_run_blocked(
+        repo,
+        state,
+        dry_run,
+        trace,
+        "Plan review",
+        f"plan review budget exhausted after {state.max_plan_rounds} rounds",
+        "plan_written",
     )
+    return read_if_present(plan_path, "DRY_RUN_PLAN")
 
 
 def run_local_review_loop(
@@ -2046,56 +2445,110 @@ def run_local_review_loop(
     if not dry_run:
         review_dir.mkdir(parents=True, exist_ok=True)
     for round_index in range(state.local_review_round, state.max_rounds + 1):
-        review_path = review_dir / f"review-{round_index}.md"
-        review_rel = repo_relative(repo, review_path)
-        trace.event(f"local review round {round_index}/{state.max_rounds}: {review_rel}")
-        review = run_agent(
-            state.reviewer,
-            "review local diff",
-            build_local_review_prompt(state.goal, state.base, plan_rel, review_rel),
-            repo,
-            dry_run,
-            log,
-            trace,
-            state,
-            artifact=review_rel,
+        resume_pending_fix = (
+            state.phase == "local_fix_pending"
+            and state.pending_review_round == round_index
+            and bool(state.pending_review_path)
         )
-        persist_review_output(review_path, review, dry_run, trace)
-        if dry_run:
-            review = APPROVAL_TOKEN
-        if ends_with_token(review, APPROVAL_TOKEN):
-            trace.event(f"review approved by {state.reviewer}")
+        review_path = (
+            resolve_repo_path(repo, pathlib.Path(state.pending_review_path))
+            if resume_pending_fix
+            else review_dir / f"review-{round_index}.md"
+        )
+        review_rel = repo_relative(repo, review_path)
+        if resume_pending_fix:
+            trace.event(f"resuming pending local fix from: {review_rel}")
+            review = read_if_present(review_path)
+            if not review.strip():
+                mark_run_blocked(
+                    repo,
+                    state,
+                    dry_run,
+                    trace,
+                    f"Local fix round {round_index}",
+                    f"pending review file is missing or empty: {review_rel}",
+                    "local_fix_pending",
+                )
+                return False
+        else:
+            trace.event(f"local review round {round_index}/{state.max_rounds}: {review_rel}")
+            review = run_agent(
+                state.reviewer,
+                "review local diff",
+                build_local_review_prompt(state.goal, state.base, plan_rel, review_rel),
+                repo,
+                dry_run,
+                log,
+                trace,
+                state,
+                artifact=review_rel,
+            )
+            persist_review_output(review_path, review, dry_run, trace)
+            if dry_run:
+                review = f"{DECISION_REASON_PREFIX} dry-run approval\n{APPROVAL_TOKEN}"
+            review_reason = extract_decision_reason(review)
+            if not review_reason:
+                mark_run_blocked(
+                    repo,
+                    state,
+                    dry_run,
+                    trace,
+                    f"Local review round {round_index}",
+                    "reviewer response omitted the required A2A_REASON line",
+                    "implementation_ready",
+                )
+                return False
+            if ends_with_token(review, APPROVAL_TOKEN):
+                trace.event(f"review approved by {state.reviewer}")
+                append_decision(
+                    repo,
+                    state,
+                    dry_run,
+                    trace,
+                    f"Local review round {round_index}: approved",
+                    [
+                        ("Reviewer", state.reviewer),
+                        ("Reason", review_reason),
+                        ("Review", review_rel),
+                    ],
+                )
+                state.phase = "approved"
+                state.approved = True
+                state.final_review_path = review_rel
+                state.pending_review_path = ""
+                state.pending_review_round = 0
+                save_state(repo, state, dry_run, trace)
+                return True
+
+            if not ends_with_token(review, REVIEW_CHANGES_TOKEN):
+                mark_run_blocked(
+                    repo,
+                    state,
+                    dry_run,
+                    trace,
+                    f"Local review round {round_index}",
+                    "reviewer response omitted the required approval or changes-requested token",
+                    "implementation_ready",
+                )
+                return False
+
             append_decision(
                 repo,
                 state,
                 dry_run,
                 trace,
-                f"Local review round {round_index}: approved",
+                f"Local review round {round_index}: changes requested",
                 [
                     ("Reviewer", state.reviewer),
-                    ("Reason", summarize_agent_output(review)),
+                    ("Reason", review_reason),
                     ("Review", review_rel),
+                    ("Next", f"{state.implementer} fixes local diff"),
                 ],
             )
-            state.phase = "approved"
-            state.approved = True
-            state.final_review_path = review_rel
+            state.phase = "local_fix_pending"
+            state.pending_review_path = review_rel
+            state.pending_review_round = round_index
             save_state(repo, state, dry_run, trace)
-            return True
-
-        append_decision(
-            repo,
-            state,
-            dry_run,
-            trace,
-            f"Local review round {round_index}: changes requested",
-            [
-                ("Reviewer", state.reviewer),
-                ("Reason", summarize_agent_output(review)),
-                ("Review", review_rel),
-                ("Next", f"{state.implementer} fixes local diff"),
-            ],
-        )
 
         fix_output = run_agent(
             state.implementer,
@@ -2114,8 +2567,30 @@ def run_local_review_loop(
             state,
             artifact=review_rel,
         )
+        if dry_run:
+            fix_output = f"{DECISION_REASON_PREFIX} dry-run fix\n{IMPLEMENTATION_READY_TOKEN}"
         persist_plan_update_block(plan_path, fix_output, dry_run, trace, f"local fix round {round_index} stdout")
-        sync_source_plan(repo, plan_path, state, dry_run, trace)
+        if not sync_source_plan(repo, plan_path, state, dry_run, trace):
+            return False
+        status = "ready" if dry_run else implementation_status(fix_output)
+        reason = extract_decision_reason(fix_output)
+        if status != "ready" or not reason:
+            reason = reason or (
+                "fixer response omitted the required A2A_REASON line: "
+                + summarize_agent_output(fix_output)
+            )
+            if status == "missing":
+                reason = "fixer response omitted the required implementation status token: " + reason
+            mark_run_blocked(
+                repo,
+                state,
+                dry_run,
+                trace,
+                f"Local fix round {round_index}",
+                reason,
+                "local_fix_pending",
+            )
+            return False
         commit_hash = commit_if_changed(
             repo,
             commit_message_from_output(
@@ -2126,6 +2601,17 @@ def run_local_review_loop(
             log,
             trace,
         )
+        if not commit_hash:
+            mark_run_blocked(
+                repo,
+                state,
+                dry_run,
+                trace,
+                f"Local fix round {round_index}",
+                "review requested changes, but the fixer produced no committable progress",
+                "local_fix_pending",
+            )
+            return False
         append_decision(
             repo,
             state,
@@ -2134,12 +2620,14 @@ def run_local_review_loop(
             f"Local fix round {round_index}: implemented",
             [
                 ("Implementer", state.implementer),
-                ("Response", summarize_agent_output(fix_output)),
+                ("Response", decision_reason(fix_output)),
                 ("Commit", commit_hash),
             ],
         )
         state.phase = "implementation_ready"
         state.local_review_round = round_index + 1
+        state.pending_review_path = ""
+        state.pending_review_round = 0
         save_state(repo, state, dry_run, trace)
 
     return False
@@ -2152,52 +2640,116 @@ def run_gh_review_loop(
     trace: WorkflowTrace,
     state: RunState,
 ) -> bool:
+    review_dir = repo / ".a2a" / "reviews" / state.run_id
+    if not dry_run:
+        review_dir.mkdir(parents=True, exist_ok=True)
     for round_index in range(state.gh_review_round, state.max_rounds + 1):
-        trace.event(f"GitHub review round {round_index}/{state.max_rounds}: {state.pr_url}")
-        review = run_agent(
-            state.reviewer,
-            "review GitHub PR",
-            build_gh_review_prompt(state.goal, state.pr_url),
-            repo,
-            dry_run,
-            log,
-            trace,
-            state,
-            artifact=state.pr_url,
+        resume_pending_fix = (
+            state.phase == "gh_fix_pending"
+            and state.pending_review_round == round_index
+            and bool(state.pending_review_path)
         )
-        if dry_run:
-            review = APPROVAL_TOKEN
-        if ends_with_token(review, APPROVAL_TOKEN):
-            trace.event(f"GitHub review approved by {state.reviewer}")
+        review_path = (
+            resolve_repo_path(repo, pathlib.Path(state.pending_review_path))
+            if resume_pending_fix
+            else review_dir / f"gh-review-{round_index}.md"
+        )
+        review_rel = repo_relative(repo, review_path)
+        if resume_pending_fix:
+            trace.event(f"resuming pending GitHub fix from: {review_rel}")
+            review = read_if_present(review_path)
+            if not review.strip():
+                mark_run_blocked(
+                    repo,
+                    state,
+                    dry_run,
+                    trace,
+                    f"GitHub fix round {round_index}",
+                    f"pending review file is missing or empty: {review_rel}",
+                    "gh_fix_pending",
+                )
+                return False
+        else:
+            trace.event(f"GitHub review round {round_index}/{state.max_rounds}: {state.pr_url}")
+            review = run_agent(
+                state.reviewer,
+                "review GitHub PR",
+                build_gh_review_prompt(state.goal, state.pr_url),
+                repo,
+                dry_run,
+                log,
+                trace,
+                state,
+                artifact=state.pr_url,
+            )
+            persist_review_output(review_path, review, dry_run, trace)
+            if dry_run:
+                review = f"{DECISION_REASON_PREFIX} dry-run approval\n{APPROVAL_TOKEN}"
+            review_reason = extract_decision_reason(review)
+            if not review_reason:
+                mark_run_blocked(
+                    repo,
+                    state,
+                    dry_run,
+                    trace,
+                    f"GitHub review round {round_index}",
+                    "reviewer response omitted the required A2A_REASON line",
+                    "pr_ready",
+                )
+                return False
+            if ends_with_token(review, APPROVAL_TOKEN):
+                trace.event(f"GitHub review approved by {state.reviewer}")
+                append_decision(
+                    repo,
+                    state,
+                    dry_run,
+                    trace,
+                    f"GitHub review round {round_index}: approved",
+                    [
+                        ("Reviewer", state.reviewer),
+                        ("Reason", review_reason),
+                        ("PR", state.pr_url),
+                        ("Review", review_rel),
+                    ],
+                )
+                state.phase = "approved"
+                state.approved = True
+                state.pending_review_path = ""
+                state.pending_review_round = 0
+                save_state(repo, state, dry_run, trace)
+                return True
+
+            if not ends_with_token(review, REVIEW_CHANGES_TOKEN):
+                mark_run_blocked(
+                    repo,
+                    state,
+                    dry_run,
+                    trace,
+                    f"GitHub review round {round_index}",
+                    "reviewer response omitted the required approval or changes-requested token",
+                    "pr_ready",
+                )
+                return False
+
             append_decision(
                 repo,
                 state,
                 dry_run,
                 trace,
-                f"GitHub review round {round_index}: approved",
+                f"GitHub review round {round_index}: changes requested",
                 [
                     ("Reviewer", state.reviewer),
-                    ("Reason", summarize_agent_output(review)),
+                    ("Reason", review_reason),
                     ("PR", state.pr_url),
+                    ("Review", review_rel),
+                    ("Next", f"{state.implementer} fixes PR comments"),
                 ],
             )
-            state.phase = "approved"
-            state.approved = True
+            state.phase = "gh_fix_pending"
+            state.pending_review_path = review_rel
+            state.pending_review_round = round_index
             save_state(repo, state, dry_run, trace)
-            return True
-        append_decision(
-            repo,
-            state,
-            dry_run,
-            trace,
-            f"GitHub review round {round_index}: changes requested",
-            [
-                ("Reviewer", state.reviewer),
-                ("Reason", summarize_agent_output(review)),
-                ("PR", state.pr_url),
-                ("Next", f"{state.implementer} fixes PR comments"),
-            ],
-        )
+
         plan_path = resolve_repo_path(repo, pathlib.Path(state.plan_path))
         fix_output = run_agent(
             state.implementer,
@@ -2215,8 +2767,30 @@ def run_gh_review_loop(
             state,
             artifact=state.pr_url,
         )
+        if dry_run:
+            fix_output = f"{DECISION_REASON_PREFIX} dry-run fix\n{IMPLEMENTATION_READY_TOKEN}"
         persist_plan_update_block(plan_path, fix_output, dry_run, trace, f"GitHub fix round {round_index} stdout")
-        sync_source_plan(repo, plan_path, state, dry_run, trace)
+        if not sync_source_plan(repo, plan_path, state, dry_run, trace):
+            return False
+        status = "ready" if dry_run else implementation_status(fix_output)
+        reason = extract_decision_reason(fix_output)
+        if status != "ready" or not reason:
+            reason = reason or (
+                "fixer response omitted the required A2A_REASON line: "
+                + summarize_agent_output(fix_output)
+            )
+            if status == "missing":
+                reason = "fixer response omitted the required implementation status token: " + reason
+            mark_run_blocked(
+                repo,
+                state,
+                dry_run,
+                trace,
+                f"GitHub fix round {round_index}",
+                reason,
+                "gh_fix_pending",
+            )
+            return False
         commit_hash = commit_if_changed(
             repo,
             commit_message_from_output(
@@ -2227,6 +2801,17 @@ def run_gh_review_loop(
             log,
             trace,
         )
+        if not commit_hash:
+            mark_run_blocked(
+                repo,
+                state,
+                dry_run,
+                trace,
+                f"GitHub fix round {round_index}",
+                "review requested changes, but the fixer produced no committable progress",
+                "gh_fix_pending",
+            )
+            return False
         append_decision(
             repo,
             state,
@@ -2235,13 +2820,12 @@ def run_gh_review_loop(
             f"GitHub fix round {round_index}: implemented",
             [
                 ("Implementer", state.implementer),
-                ("Response", summarize_agent_output(fix_output)),
+                ("Response", decision_reason(fix_output)),
                 ("Commit", commit_hash),
             ],
         )
-        if commit_hash:
-            push_result = run(["git", "push"], cwd=repo, dry_run=dry_run, log_file=log)
-            require_ok(push_result, "push coordinator fixes")
+        push_result = run(["git", "push"], cwd=repo, dry_run=dry_run, log_file=log)
+        require_ok(push_result, "push coordinator fixes")
         gh_text(
             repo,
             ["pr", "comment", state.pr_url, "--body", f"Implementer pushed fixes for round {round_index}."],
@@ -2250,6 +2834,8 @@ def run_gh_review_loop(
         )
         state.phase = "pr_ready"
         state.gh_review_round = round_index + 1
+        state.pending_review_path = ""
+        state.pending_review_round = 0
         save_state(repo, state, dry_run, trace)
 
     return False
@@ -2285,6 +2871,11 @@ def main() -> int:
             "Resume a checkpoint from .a2a/runs/<id>/state.json, or pass a state path. "
             "With no value, resumes the newest .a2a/runs/* checkpoint."
         ),
+    )
+    parser.add_argument(
+        "--retry-blocked",
+        action="store_true",
+        help="Retry a blocked phase after its blocker has been resolved. Requires --resume.",
     )
     parser.add_argument("--base", default="main", help="Base branch for diff review and PR creation.")
     parser.add_argument("--branch", help="Branch to create/use. Defaults to a timestamped a2a/* branch.")
@@ -2336,6 +2927,8 @@ def main() -> int:
         help="Let claude inherit ANTHROPIC_* API-key auth instead of using claude.ai login/subscription auth.",
     )
     args = parser.parse_args()
+    if args.retry_blocked and args.resume is None:
+        raise SystemExit("--retry-blocked requires --resume")
     args.codex_effort = normalize_codex_effort(args.codex_effort)
     # argparse choices do not validate defaults, so an effort injected via
     # A2A_CLAUDE_EFFORT is checked here on the resolved value.
@@ -2381,6 +2974,7 @@ def main() -> int:
     if not initial_repo.exists():
         raise SystemExit(f"Repo does not exist: {initial_repo}")
 
+    resume_state_migrated = False
     if args.resume is not None:
         loaded_path = resolve_state_path(initial_repo, args.resume).resolve()
         state = load_state(loaded_path)
@@ -2452,6 +3046,10 @@ def main() -> int:
             trace.event("resume setting: verbose=true from checkpoint; pass --no-verbose to disable")
         for override in overrides:
             trace.event(f"resume override: {override}")
+        migrated_review = migrate_legacy_pending_fix(repo, state)
+        if migrated_review:
+            resume_state_migrated = True
+            trace.event(f"resume migration: pending local fix recovered from {migrated_review}")
     else:
         repo = initial_repo
         if not args.goal and not args.plan:
@@ -2514,7 +3112,25 @@ def main() -> int:
             verbose=args.verbose,
             log_path=str(log),
             decision_log_path=repo_relative(repo, decision_log_path(repo, stamp)),
+            source_plan_sha256=(
+                plan_digest(plan_path.read_text(encoding="utf-8"))
+                if source_plan_path and plan_path.exists() and not args.dry_run
+                else ""
+            ),
         )
+
+    if args.resume is not None and state.phase == "blocked":
+        if not args.retry_blocked:
+            return blocked_exit(state, log, trace)
+        if not state.blocked_resume_phase:
+            raise SystemExit(
+                "Blocked checkpoint has no resume phase. Inspect its decisions.md and state.json before retrying."
+            )
+        retry_phase = state.blocked_resume_phase
+        trace.event(f"retrying previously blocked phase: {retry_phase}")
+        state.phase = retry_phase
+        state.blocked_reason = ""
+        state.blocked_resume_phase = ""
 
     ensure_a2a_dirs(repo, args.dry_run)
     trace.event(f"repo: {repo}")
@@ -2534,6 +3150,8 @@ def main() -> int:
     if args.resume is not None:
         trace.event(f"branch checkout: {state.branch}")
         checkout_branch(repo, state.branch, args.dry_run, log)
+        if args.retry_blocked or resume_state_migrated:
+            save_state(repo, state, args.dry_run, trace)
     else:
         trace.event(f"branch setup: {state.branch}")
         ensure_branch(repo, state.branch, state.base, args.dry_run, log, trace)
@@ -2549,6 +3167,8 @@ def main() -> int:
         state,
         create_plan=create_plan,
     )
+    if state.phase == "blocked":
+        return blocked_exit(state, log, trace)
 
     if state.phase == "plan_ready":
         implement_output = run_agent(
@@ -2569,7 +3189,27 @@ def main() -> int:
             artifact=repo_relative(repo, plan_path),
         )
         persist_plan_update_block(plan_path, implement_output, args.dry_run, trace, "implementation stdout")
-        sync_source_plan(repo, plan_path, state, args.dry_run, trace)
+        if not sync_source_plan(repo, plan_path, state, args.dry_run, trace):
+            return blocked_exit(state, log, trace)
+        status = "ready" if args.dry_run else implementation_status(implement_output)
+        reason = "dry-run implementation" if args.dry_run else extract_decision_reason(implement_output)
+        if status != "ready" or not reason:
+            reason = reason or (
+                "implementer response omitted the required A2A_REASON line: "
+                + summarize_agent_output(implement_output)
+            )
+            if status == "missing":
+                reason = "implementer response omitted the required implementation status token: " + reason
+            mark_run_blocked(
+                repo,
+                state,
+                args.dry_run,
+                trace,
+                "Implementation",
+                reason,
+                "plan_ready",
+            )
+            return blocked_exit(state, log, trace)
         commit_hash = commit_if_changed(
             repo,
             commit_message_from_output(
@@ -2580,6 +3220,17 @@ def main() -> int:
             log,
             trace,
         )
+        if not commit_hash:
+            mark_run_blocked(
+                repo,
+                state,
+                args.dry_run,
+                trace,
+                "Implementation",
+                "implementer reported completion but produced no committable progress",
+                "plan_ready",
+            )
+            return blocked_exit(state, log, trace)
         append_decision(
             repo,
             state,
@@ -2588,7 +3239,7 @@ def main() -> int:
             "Implementation: completed",
             [
                 ("Implementer", state.implementer),
-                ("Response", summarize_agent_output(implement_output)),
+                ("Response", decision_reason(implement_output)),
                 ("Commit", commit_hash),
             ],
         )
@@ -2596,7 +3247,7 @@ def main() -> int:
         save_state(repo, state, args.dry_run, trace)
     elif state.phase == "implementation_ready":
         trace.event("implementation already ready; resuming review")
-    elif state.phase in ("approved", "pr_ready", "done"):
+    elif state.phase in ("local_fix_pending", "gh_fix_pending", "approved", "pr_ready", "done"):
         trace.event(f"implementation/review already reached phase: {state.phase}")
     else:
         raise SystemExit(f"Cannot continue from phase {state.phase}")
@@ -2667,6 +3318,8 @@ def main() -> int:
                 save_state(repo, state, args.dry_run, trace)
 
     if not approved:
+        if state.phase == "blocked":
+            return blocked_exit(state, log, trace)
         pr_note = f" PR: {state.pr_url}" if state.pr_url else ""
         trace.event(f"not approved within {state.max_rounds} review rounds.{pr_note}")
         trace.event(f"resume with: a2a-loop --resume {state.run_id}")
