@@ -130,7 +130,9 @@ auth status:` from `claude auth status --json` at startup when applicable.
 - Claude reviewer turns use `dontAsk` with a narrow allowlist for read-only Git,
   PR inspection, and standard test runners, never unrestricted Bash.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the run
-  ledger, and coordinator-persisted plan updates sync back to the source plan.
+  ledger. SHA-256 optimistic synchronization imports source-only operator
+  edits, exports ledger-only changes, and blocks concurrent divergence without
+  overwriting either copy.
 - Inspect the concise `.a2a/logs/<timestamp>/run.log`, raw
   `.a2a/logs/<timestamp>/steps/`, `.a2a/runs/<run-id>/decisions.md`,
   `.a2a/plans/`, and `.a2a/reviews/` when debugging a run.
@@ -148,6 +150,9 @@ auth status:` from `claude auth status --json` at startup when applicable.
 - Reviews are checkpointed before the fixer starts. A blocked checkpoint does
   not rerun implicitly; after resolving the blocker, use
   `a2a-loop --resume <run-id> --retry-blocked`.
+- A plan reviewer uses `PLAN_STATUS: blocked` for human-only decisions. Plan
+  review budget exhaustion is also checkpointed as blocked instead of leaving
+  a dangling `plan_written` state.
 - Older checkpoints with a persisted changes-requested review and no recorded
   fix are migrated to the pending-fix phase on resume, avoiding a duplicate
   reviewer turn.

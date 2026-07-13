@@ -130,6 +130,12 @@ If `--plan path/to/existing.plan.md` is passed, the coordinator skips initial
 plan creation and uses that file in place. It still runs implementer plan review
 and reviewer plan approval unless `--skip-plan-review` is passed.
 
+The run keeps a SHA-256 checkpoint for external source plans. A source-only
+operator edit is imported into the private run ledger, a ledger-only agent edit
+is exported to the source, and concurrent edits block without overwriting either
+copy. Reviewer-required human decisions and exhausted plan-review budgets also
+produce explicit blocked checkpoints; retry only after resolving the cause.
+
 ## Plan Contract
 
 The plan file is the run's contract, and the coordinator enforces it
@@ -395,7 +401,9 @@ plain `--resume` keeps the run's original settings. If a saved run has
   Code snippets and raw tool output stay in the per-turn step logs instead of
   the terminal or coordinator log.
 - Existing plans outside `.a2a/` are copied into `.a2a/plans/` as the run
-  ledger, and coordinator-persisted plan updates sync back to the source plan.
+  ledger. SHA-256 optimistic synchronization imports source-only operator edits,
+  exports ledger-only updates, and blocks on concurrent divergence rather than
+  choosing a last writer.
 - `.a2a/logs/<timestamp>/run.log` is the concise coordinator log. Full prompts,
   JSON events, stdout, stderr, and tool output live in per-turn files under
   `.a2a/logs/<timestamp>/steps/`, keeping the main log useful for `tail -f`.

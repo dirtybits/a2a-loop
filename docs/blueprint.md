@@ -65,6 +65,7 @@ PLAN_READY
 PLAN_REVIEW_READY
 PLAN_STATUS: approved
 PLAN_STATUS: changes_requested
+PLAN_STATUS: blocked
 IMPLEMENTATION_READY
 IMPLEMENTATION_STATUS: blocked
 REVIEW_STATUS: changes_requested
@@ -84,12 +85,18 @@ loop alive or fails closed.
 The coordinator checkpoints a completed review before starting its fixer. A
 blocked or no-progress fixer does not consume another review round; the
 operator resolves the cause and explicitly resumes with `--retry-blocked`.
+Plan reviewers use `PLAN_STATUS: blocked` when human authority is required,
+and plan-review budget exhaustion creates the same explicit resumable stop.
 
 ## Plan-as-Contract
 
 The plan file is the loop's contract, so the run must not have unrestricted
 write access to its own contract. The coordinator owns every plan write
 (agents return updates on stdout) and enforces:
+
+- optimistic SHA-256 synchronization between an external source plan and the
+  private run ledger: import source-only edits, export ledger-only edits, and
+  block without modifying either file when both changed independently;
 
 - Append-only body: updates that delete existing headings are rejected
   before touching the file.
